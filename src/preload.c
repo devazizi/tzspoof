@@ -1,6 +1,7 @@
 #ifndef _GNU_SOURCE
 #define _GNU_SOURCE
 #endif
+#pragma GCC diagnostic ignored "-Wnonnull-compare"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -10,6 +11,16 @@
 #include <stdarg.h>
 #include <sys/types.h>
 #include <sys/stat.h>
+
+/* Forward declarations for legacy glibc stat functions if headers omit them */
+int __xstat(int ver, const char *path, struct stat *statbuf);
+int __xstat64(int ver, const char *path, struct stat64 *statbuf);
+int __lxstat(int ver, const char *path, struct stat *statbuf);
+int __lxstat64(int ver, const char *path, struct stat64 *statbuf);
+int __fxstat(int ver, int fd, struct stat *statbuf);
+int __fxstat64(int ver, int fd, struct stat64 *statbuf);
+int __fxstatat(int ver, int dirfd, const char *path, struct stat *statbuf, int flags);
+int __fxstatat64(int ver, int dirfd, const char *path, struct stat64 *statbuf, int flags);
 
 static ssize_t (*real_readlink)(const char *, char *, size_t) = NULL;
 static ssize_t (*real_readlink_chk)(const char *, char *, size_t, size_t) = NULL;
@@ -21,16 +32,82 @@ static int (*real_open64)(const char *, int, ...) = NULL;
 static int (*real_openat)(int, const char *, int, ...) = NULL;
 static int (*real_openat64)(int, const char *, int, ...) = NULL;
 
+static int (*real_stat)(const char *, struct stat *) = NULL;
+static int (*real_stat64)(const char *, struct stat64 *) = NULL;
+static int (*real_lstat)(const char *, struct stat *) = NULL;
+static int (*real_lstat64)(const char *, struct stat64 *) = NULL;
+static int (*real_fstat)(int, struct stat *) = NULL;
+static int (*real_fstat64)(int, struct stat64 *) = NULL;
+static int (*real_fstatat)(int, const char *, struct stat *, int) = NULL;
+static int (*real_fstatat64)(int, const char *, struct stat64 *, int) = NULL;
+
+static int (*real_xstat)(int, const char *, struct stat *) = NULL;
+static int (*real_xstat64)(int, const char *, struct stat64 *) = NULL;
+static int (*real_lxstat)(int, const char *, struct stat *) = NULL;
+static int (*real_lxstat64)(int, const char *, struct stat64 *) = NULL;
+static int (*real_fxstat)(int, int, struct stat *) = NULL;
+static int (*real_fxstat64)(int, int, struct stat64 *) = NULL;
+static int (*real_fxstatat)(int, int, const char *, struct stat *, int) = NULL;
+static int (*real_fxstatat64)(int, int, const char *, struct stat64 *, int) = NULL;
+
+static int (*real_statx)(int, const char *, int, unsigned int, struct statx *) = NULL;
+
 static void init_hooks(void) {
-    if (!real_readlink)     real_readlink     = dlsym(RTLD_NEXT, "readlink");
-    if (!real_readlink_chk) real_readlink_chk = dlsym(RTLD_NEXT, "__readlink_chk");
-    if (!real_readlinkat)   real_readlinkat   = dlsym(RTLD_NEXT, "readlinkat");
+    static int initialized = 0;
+    if (initialized) return;
+    initialized = 1;
+
+    if (!real_readlink)       real_readlink       = dlsym(RTLD_NEXT, "readlink");
+    if (!real_readlink_chk)   real_readlink_chk   = dlsym(RTLD_NEXT, "__readlink_chk");
+    if (!real_readlinkat)     real_readlinkat     = dlsym(RTLD_NEXT, "readlinkat");
     if (!real_readlinkat_chk) real_readlinkat_chk = dlsym(RTLD_NEXT, "__readlinkat_chk");
 
-    if (!real_open)         real_open         = dlsym(RTLD_NEXT, "open");
-    if (!real_open64)       real_open64       = dlsym(RTLD_NEXT, "open64");
-    if (!real_openat)       real_openat       = dlsym(RTLD_NEXT, "openat");
-    if (!real_openat64)     real_openat64     = dlsym(RTLD_NEXT, "openat64");
+    if (!real_open)           real_open           = dlsym(RTLD_NEXT, "open");
+    if (!real_open64)         real_open64         = dlsym(RTLD_NEXT, "open64");
+    if (!real_openat)         real_openat         = dlsym(RTLD_NEXT, "openat");
+    if (!real_openat64)       real_openat64       = dlsym(RTLD_NEXT, "openat64");
+
+    if (!real_stat)           real_stat           = dlsym(RTLD_NEXT, "stat");
+    if (!real_stat64)         real_stat64         = dlsym(RTLD_NEXT, "stat64");
+    if (!real_lstat)          real_lstat          = dlsym(RTLD_NEXT, "lstat");
+    if (!real_lstat64)        real_lstat64        = dlsym(RTLD_NEXT, "lstat64");
+    if (!real_fstat)          real_fstat          = dlsym(RTLD_NEXT, "fstat");
+    if (!real_fstat64)        real_fstat64        = dlsym(RTLD_NEXT, "fstat64");
+    if (!real_fstatat)        real_fstatat        = dlsym(RTLD_NEXT, "fstatat");
+    if (!real_fstatat64)      real_fstatat64      = dlsym(RTLD_NEXT, "fstatat64");
+
+    if (!real_xstat)          real_xstat          = dlsym(RTLD_NEXT, "__xstat");
+    if (!real_xstat64)        real_xstat64        = dlsym(RTLD_NEXT, "__xstat64");
+    if (!real_lxstat)         real_lxstat         = dlsym(RTLD_NEXT, "__lxstat");
+    if (!real_lxstat64)       real_lxstat64       = dlsym(RTLD_NEXT, "__lxstat64");
+    if (!real_fxstat)         real_fxstat         = dlsym(RTLD_NEXT, "__fxstat");
+    if (!real_fxstat64)       real_fxstat64       = dlsym(RTLD_NEXT, "__fxstat64");
+    if (!real_fxstatat)       real_fxstatat       = dlsym(RTLD_NEXT, "__fxstatat");
+    if (!real_fxstatat64)     real_fxstatat64     = dlsym(RTLD_NEXT, "__fxstatat64");
+
+    if (!real_statx)          real_statx          = dlsym(RTLD_NEXT, "statx");
+}
+
+/* Helper to map overflow UID/GID (nobody/65534) to root (0) inside unprivileged user namespace */
+static inline void fix_stat_buf(struct stat *buf) {
+    if (buf) {
+        if (buf->st_uid == 65534) buf->st_uid = 0;
+        if (buf->st_gid == 65534) buf->st_gid = 0;
+    }
+}
+
+static inline void fix_stat64_buf(struct stat64 *buf) {
+    if (buf) {
+        if (buf->st_uid == 65534) buf->st_uid = 0;
+        if (buf->st_gid == 65534) buf->st_gid = 0;
+    }
+}
+
+static inline void fix_statx_buf(struct statx *buf) {
+    if (buf) {
+        if (buf->stx_uid == 65534) buf->stx_uid = 0;
+        if (buf->stx_gid == 65534) buf->stx_gid = 0;
+    }
 }
 
 /* Helper to spoof readlink buffer */
@@ -46,7 +123,7 @@ static ssize_t do_spoof_readlink(char *buf, size_t bufsiz) {
 
 ssize_t readlink(const char *pathname, char *buf, size_t bufsiz) {
     init_hooks();
-    if (strcmp(pathname, "/etc/localtime") == 0) {
+    if (pathname && strcmp(pathname, "/etc/localtime") == 0) {
         ssize_t res = do_spoof_readlink(buf, bufsiz);
         if (res >= 0) return res;
     }
@@ -55,7 +132,7 @@ ssize_t readlink(const char *pathname, char *buf, size_t bufsiz) {
 
 ssize_t __readlink_chk(const char *pathname, char *buf, size_t bufsiz, size_t buflen) {
     init_hooks();
-    if (strcmp(pathname, "/etc/localtime") == 0) {
+    if (pathname && strcmp(pathname, "/etc/localtime") == 0) {
         ssize_t res = do_spoof_readlink(buf, bufsiz);
         if (res >= 0) return res;
     }
@@ -64,7 +141,7 @@ ssize_t __readlink_chk(const char *pathname, char *buf, size_t bufsiz, size_t bu
 
 ssize_t readlinkat(int dirfd, const char *pathname, char *buf, size_t bufsiz) {
     init_hooks();
-    if (strcmp(pathname, "/etc/localtime") == 0) {
+    if (pathname && strcmp(pathname, "/etc/localtime") == 0) {
         ssize_t res = do_spoof_readlink(buf, bufsiz);
         if (res >= 0) return res;
     }
@@ -73,7 +150,7 @@ ssize_t readlinkat(int dirfd, const char *pathname, char *buf, size_t bufsiz) {
 
 ssize_t __readlinkat_chk(int dirfd, const char *pathname, char *buf, size_t bufsiz, size_t buflen) {
     init_hooks();
-    if (strcmp(pathname, "/etc/localtime") == 0) {
+    if (pathname && strcmp(pathname, "/etc/localtime") == 0) {
         ssize_t res = do_spoof_readlink(buf, bufsiz);
         if (res >= 0) return res;
     }
@@ -92,7 +169,7 @@ int open(const char *pathname, int flags, ...) {
     }
 
     const char *target = getenv("TZSPOOF_TARGET_PATH");
-    if (target && strcmp(pathname, "/etc/localtime") == 0) {
+    if (target && pathname && strcmp(pathname, "/etc/localtime") == 0) {
         pathname = target;
     }
 
@@ -110,7 +187,7 @@ int open64(const char *pathname, int flags, ...) {
     }
 
     const char *target = getenv("TZSPOOF_TARGET_PATH");
-    if (target && strcmp(pathname, "/etc/localtime") == 0) {
+    if (target && pathname && strcmp(pathname, "/etc/localtime") == 0) {
         pathname = target;
     }
 
@@ -128,7 +205,7 @@ int openat(int dirfd, const char *pathname, int flags, ...) {
     }
 
     const char *target = getenv("TZSPOOF_TARGET_PATH");
-    if (target && strcmp(pathname, "/etc/localtime") == 0) {
+    if (target && pathname && strcmp(pathname, "/etc/localtime") == 0) {
         pathname = target;
         dirfd = AT_FDCWD;
     }
@@ -147,10 +224,187 @@ int openat64(int dirfd, const char *pathname, int flags, ...) {
     }
 
     const char *target = getenv("TZSPOOF_TARGET_PATH");
-    if (target && strcmp(pathname, "/etc/localtime") == 0) {
+    if (target && pathname && strcmp(pathname, "/etc/localtime") == 0) {
         pathname = target;
         dirfd = AT_FDCWD;
     }
 
     return real_openat64 ? real_openat64(dirfd, pathname, flags, mode) : -1;
+}
+
+/* Stat hooks to redirect /etc/localtime and fix UID/GID in user namespaces */
+int stat(const char *pathname, struct stat *buf) {
+    init_hooks();
+    const char *target = getenv("TZSPOOF_TARGET_PATH");
+    if (target && pathname && strcmp(pathname, "/etc/localtime") == 0) {
+        pathname = target;
+    }
+    int res = real_stat ? real_stat(pathname, buf) : -1;
+    if (res == 0) fix_stat_buf(buf);
+    return res;
+}
+
+int stat64(const char *pathname, struct stat64 *buf) {
+    init_hooks();
+    const char *target = getenv("TZSPOOF_TARGET_PATH");
+    if (target && pathname && strcmp(pathname, "/etc/localtime") == 0) {
+        pathname = target;
+    }
+    int res = real_stat64 ? real_stat64(pathname, buf) : -1;
+    if (res == 0) fix_stat64_buf(buf);
+    return res;
+}
+
+int lstat(const char *pathname, struct stat *buf) {
+    init_hooks();
+    const char *target = getenv("TZSPOOF_TARGET_PATH");
+    if (target && pathname && strcmp(pathname, "/etc/localtime") == 0) {
+        pathname = target;
+    }
+    int res = real_lstat ? real_lstat(pathname, buf) : -1;
+    if (res == 0) fix_stat_buf(buf);
+    return res;
+}
+
+int lstat64(const char *pathname, struct stat64 *buf) {
+    init_hooks();
+    const char *target = getenv("TZSPOOF_TARGET_PATH");
+    if (target && pathname && strcmp(pathname, "/etc/localtime") == 0) {
+        pathname = target;
+    }
+    int res = real_lstat64 ? real_lstat64(pathname, buf) : -1;
+    if (res == 0) fix_stat64_buf(buf);
+    return res;
+}
+
+int fstat(int fd, struct stat *buf) {
+    init_hooks();
+    int res = real_fstat ? real_fstat(fd, buf) : -1;
+    if (res == 0) fix_stat_buf(buf);
+    return res;
+}
+
+int fstat64(int fd, struct stat64 *buf) {
+    init_hooks();
+    int res = real_fstat64 ? real_fstat64(fd, buf) : -1;
+    if (res == 0) fix_stat64_buf(buf);
+    return res;
+}
+
+int fstatat(int dirfd, const char *pathname, struct stat *buf, int flags) {
+    init_hooks();
+    const char *target = getenv("TZSPOOF_TARGET_PATH");
+    if (target && pathname && strcmp(pathname, "/etc/localtime") == 0) {
+        pathname = target;
+        dirfd = AT_FDCWD;
+    }
+    int res = real_fstatat ? real_fstatat(dirfd, pathname, buf, flags) : -1;
+    if (res == 0) fix_stat_buf(buf);
+    return res;
+}
+
+int fstatat64(int dirfd, const char *pathname, struct stat64 *buf, int flags) {
+    init_hooks();
+    const char *target = getenv("TZSPOOF_TARGET_PATH");
+    if (target && pathname && strcmp(pathname, "/etc/localtime") == 0) {
+        pathname = target;
+        dirfd = AT_FDCWD;
+    }
+    int res = real_fstatat64 ? real_fstatat64(dirfd, pathname, buf, flags) : -1;
+    if (res == 0) fix_stat64_buf(buf);
+    return res;
+}
+
+int __xstat(int ver, const char *pathname, struct stat *buf) {
+    init_hooks();
+    const char *target = getenv("TZSPOOF_TARGET_PATH");
+    if (target && pathname && strcmp(pathname, "/etc/localtime") == 0) {
+        pathname = target;
+    }
+    int res = real_xstat ? real_xstat(ver, pathname, buf) : -1;
+    if (res == 0) fix_stat_buf(buf);
+    return res;
+}
+
+int __xstat64(int ver, const char *pathname, struct stat64 *buf) {
+    init_hooks();
+    const char *target = getenv("TZSPOOF_TARGET_PATH");
+    if (target && pathname && strcmp(pathname, "/etc/localtime") == 0) {
+        pathname = target;
+    }
+    int res = real_xstat64 ? real_xstat64(ver, pathname, buf) : -1;
+    if (res == 0) fix_stat64_buf(buf);
+    return res;
+}
+
+int __lxstat(int ver, const char *pathname, struct stat *buf) {
+    init_hooks();
+    const char *target = getenv("TZSPOOF_TARGET_PATH");
+    if (target && pathname && strcmp(pathname, "/etc/localtime") == 0) {
+        pathname = target;
+    }
+    int res = real_lxstat ? real_lxstat(ver, pathname, buf) : -1;
+    if (res == 0) fix_stat_buf(buf);
+    return res;
+}
+
+int __lxstat64(int ver, const char *pathname, struct stat64 *buf) {
+    init_hooks();
+    const char *target = getenv("TZSPOOF_TARGET_PATH");
+    if (target && pathname && strcmp(pathname, "/etc/localtime") == 0) {
+        pathname = target;
+    }
+    int res = real_lxstat64 ? real_lxstat64(ver, pathname, buf) : -1;
+    if (res == 0) fix_stat64_buf(buf);
+    return res;
+}
+
+int __fxstat(int ver, int fd, struct stat *buf) {
+    init_hooks();
+    int res = real_fxstat ? real_fxstat(ver, fd, buf) : -1;
+    if (res == 0) fix_stat_buf(buf);
+    return res;
+}
+
+int __fxstat64(int ver, int fd, struct stat64 *buf) {
+    init_hooks();
+    int res = real_fxstat64 ? real_fxstat64(ver, fd, buf) : -1;
+    if (res == 0) fix_stat64_buf(buf);
+    return res;
+}
+
+int __fxstatat(int ver, int dirfd, const char *pathname, struct stat *buf, int flags) {
+    init_hooks();
+    const char *target = getenv("TZSPOOF_TARGET_PATH");
+    if (target && pathname && strcmp(pathname, "/etc/localtime") == 0) {
+        pathname = target;
+        dirfd = AT_FDCWD;
+    }
+    int res = real_fxstatat ? real_fxstatat(ver, dirfd, pathname, buf, flags) : -1;
+    if (res == 0) fix_stat_buf(buf);
+    return res;
+}
+
+int __fxstatat64(int ver, int dirfd, const char *pathname, struct stat64 *buf, int flags) {
+    init_hooks();
+    const char *target = getenv("TZSPOOF_TARGET_PATH");
+    if (target && pathname && strcmp(pathname, "/etc/localtime") == 0) {
+        pathname = target;
+        dirfd = AT_FDCWD;
+    }
+    int res = real_fxstatat64 ? real_fxstatat64(ver, dirfd, pathname, buf, flags) : -1;
+    if (res == 0) fix_stat64_buf(buf);
+    return res;
+}
+
+int statx(int dirfd, const char *pathname, int flags, unsigned int mask, struct statx *buf) {
+    init_hooks();
+    const char *target = getenv("TZSPOOF_TARGET_PATH");
+    if (target && pathname && strcmp(pathname, "/etc/localtime") == 0) {
+        pathname = target;
+        dirfd = AT_FDCWD;
+    }
+    int res = real_statx ? real_statx(dirfd, pathname, flags, mask, buf) : -1;
+    if (res == 0) fix_statx_buf(buf);
+    return res;
 }

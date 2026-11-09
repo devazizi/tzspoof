@@ -54,6 +54,10 @@ test: all
 	@if command -v python3 >/dev/null 2>&1; then \
 		./$(TARGET) -q ny python3 -c "import time; assert 'EST' in time.tzname or 'EDT' in time.tzname" && echo "  [PASS] Python tzname check"; \
 	fi
+	@echo "Test 6: OpenSSH configuration parsing & UID check"
+	@if command -v ssh >/dev/null 2>&1; then \
+		./$(TARGET) -q tokyo ssh -G localhost >/dev/null 2>&1 && echo "  [PASS] OpenSSH config check"; \
+	fi
 	@echo "All tests passed successfully!"
 
 install: all
