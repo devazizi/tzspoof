@@ -23,6 +23,9 @@ ROOT = Path(__file__).resolve().parent.parent
 TZSPOOF = ROOT / "bin" / "tzspoof"
 ZONEINFO = Path("/usr/share/zoneinfo")
 HOST_ZONE = "Europe/Paris"  # fixture zone for the fake host
+HOST_NAME = "fixture-host"  # fixture /etc/hostname content
+# Mirrors systemd distros where nss-resolve answers before /etc/hosts.
+NSSWITCH_HOSTS = "hosts: mymachines resolve [!UNAVAIL=return] files myhostname dns"
 
 MS_BIND = 0x1000
 MS_REC = 0x4000
@@ -53,7 +56,7 @@ def _inner(mountpoint: str, localtime_kind: str, cmd: str) -> None:
     fake_etc.mkdir()
     _mount(b"/etc", str(real_etc).encode(), None, MS_BIND | MS_REC)
     for entry in os.listdir(real_etc):
-        if entry not in ("localtime", "timezone"):
+        if entry not in ("localtime", "timezone", "hostname", "hosts", "nsswitch.conf"):
             (fake_etc / entry).symlink_to(real_etc / entry)
 
     zone_file = ZONEINFO / HOST_ZONE
@@ -62,6 +65,9 @@ def _inner(mountpoint: str, localtime_kind: str, cmd: str) -> None:
     else:
         (fake_etc / "localtime").write_bytes(zone_file.read_bytes())
     (fake_etc / "timezone").write_text(HOST_ZONE + "\n")
+    (fake_etc / "hostname").write_text(HOST_NAME + "\n")
+    (fake_etc / "hosts").write_text(f"127.0.0.1 localhost\n127.0.1.1 {HOST_NAME}\n")
+    (fake_etc / "nsswitch.conf").write_text(f"passwd: files\ngroup: files\n{NSSWITCH_HOSTS}\n")
     _mount(str(fake_etc).encode(), b"/etc", None, MS_BIND | MS_REC)
 
     env = {k: v for k, v in os.environ.items()
@@ -138,6 +144,85 @@ class SymlinkHostTest(unittest.TestCase):
                   "except OSError as e:\n print(errno.errorcode[e.errno])")
         out = lines(sandbox(f"$T -q -e tokyo {sys.executable} -I -c \"{script}\""))
         self.assertEqual(out, ["ELOOP"])
+
+
+@unittest.skipUnless(TZSPOOF.exists(), "run 'make' first")
+class HostnameTest(unittest.TestCase):
+    """-H/--hostname: UTS namespace plus /etc/hostname, /etc/hosts, nsswitch."""
+
+    def test_kernel_and_files_report_spoofed_name(self):
+        out = lines(sandbox(
+            "$T -q -H build-01.example utc sh -c 'uname -n; cat /proc/sys/kernel/hostname; "
+            "cat /etc/hostname; echo $HOSTNAME'; uname -n"))
+        self.assertEqual(out[:4], ["build-01.example"] * 4)
+        self.assertNotEqual(out[4], "build-01.example")  # outside the session: unchanged
+
+    def test_spoofed_name_resolves_forward_and_reverse(self):
+        out = lines(sandbox(
+            "$T -q -H build-01 utc sh -c 'getent hosts build-01; getent hosts 127.0.1.1; "
+            "grep -c localhost /etc/hosts'"))
+        self.assertEqual(out[0].split(), ["127.0.1.1", "build-01"])
+        self.assertEqual(out[1].split(), ["127.0.1.1", "build-01"])
+        self.assertEqual(out[2], "1")  # original entries are kept
+
+    def test_nsswitch_consults_files_first(self):
+        out = lines(sandbox("$T -q -H build-01 utc grep ^hosts: /etc/nsswitch.conf"))
+        self.assertEqual(out, ["hosts: files mymachines resolve [!UNAVAIL=return] myhostname dns"])
+
+    def test_without_flag_nothing_changes(self):
+        out = lines(sandbox("$T -q utc sh -c 'cat /etc/hostname; grep ^hosts: /etc/nsswitch.conf'"))
+        self.assertEqual(out, [HOST_NAME, NSSWITCH_HOSTS])
+
+    def test_nested_sessions(self):
+        out = lines(sandbox("$T -q -H outer utc $T -q -H inner tokyo sh -c 'uname -n; cat /etc/hostname'"))
+        self.assertEqual(out, ["inner", "inner"])
+
+    def test_rejects_invalid_names_and_env_only(self):
+        for args in ("-H -bad", "-H bad-", "-H a..b", "-H 'sp ace'", f"-H {'a' * 65}", "-e -H ok"):
+            with self.subTest(args=args):
+                res = sandbox(f"$T -q {args} utc true")
+                self.assertEqual(res.returncode, 1, res.stderr)
+                self.assertIn("Error", res.stderr)
+
+
+@unittest.skipUnless(TZSPOOF.exists(), "run 'make' first")
+class CliTest(unittest.TestCase):
+    """Option placement relative to TIMEZONE and the command."""
+
+    def test_options_after_timezone_with_shell(self):
+        # Regression: "-s ZONE -H NAME" used to treat "-H NAME" as a command
+        # that --shell then silently dropped.
+        out = lines(sandbox("echo 'uname -n' | SHELL=/bin/sh $T -q -s Asia/Tokyo -H john-anderson"))
+        self.assertEqual(out, ["john-anderson"])
+
+    def test_command_arguments_are_not_parsed(self):
+        out = lines(sandbox(f"$T utc -q {sys.executable} -I -c 'import sys; print(sys.argv[1:])' -H x"))
+        self.assertEqual(out, ["['-H', 'x']"])
+
+    def test_shell_with_command_is_rejected(self):
+        res = sandbox("$T -q -s utc date")
+        self.assertEqual(res.returncode, 1)
+        self.assertIn("--shell cannot be combined", res.stderr)
+
+
+@unittest.skipUnless((ROOT / "bin" / "libtzspoof.so").exists(), "run 'make' first")
+class PreloadAbiTest(unittest.TestCase):
+    """libtzspoof.so is injected into programs that may bundle an older
+    libc (e.g. staticx binaries), so it must not need recent symbol versions."""
+
+    MAX_GLIBC = (2, 34)  # dlsym moved into libc in 2.34
+
+    def test_no_recent_glibc_symbol_versions(self):
+        import re
+        import shutil
+        if not shutil.which("objdump"):
+            self.skipTest("objdump not installed")
+        dump = subprocess.run(["objdump", "-T", str(ROOT / "bin" / "libtzspoof.so")],
+                              capture_output=True, text=True, check=True).stdout
+        too_new = sorted({f"{m.group(0)} {line.split()[-1]}" for line in dump.splitlines()
+                          for m in [re.search(r"GLIBC_(\d+)\.(\d+)", line)]
+                          if m and (int(m.group(1)), int(m.group(2))) > self.MAX_GLIBC})
+        self.assertEqual(too_new, [], "symbols need a newer glibc than bundled runtimes may have")
 
 
 @unittest.skipUnless(TZSPOOF.exists(), "run 'make' first")

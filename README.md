@@ -13,6 +13,7 @@ A lightweight, zero-dependency, high-fidelity **Timezone Spoofing Utility** for 
 - **Works with Static & Dynamic Binaries**: Because changes happen at the Linux Virtual File System (VFS) layer, statically linked binaries (Go, Rust), dynamic libraries (glibc/musl), and interpreted runtimes (Python, Node.js, Ruby) all see the spoofed timezone identically.
 - **Companion Preload Hook (`libtzspoof.so`)**: Intercepts `readlink`, `__readlink_chk`, and `readlinkat` on `/etc/localtime`, ensuring utilities that inspect the symlink target directly (such as `readlink /etc/localtime`) report the exact target timezone path.
 - **Smart Aliases & Fuzzy Matching**: Supports popular shortcuts (e.g. `tokyo`, `london`, `ny`, `la`, `berlin`, `tehran`, `dubai`, `utc`), case-insensitive searches, and city suffix resolution.
+- **Optional Hostname Spoofing (`-H NAME`)**: Adds a UTS namespace so `uname -n`, `hostname`, `gethostname()` and `/proc/sys/kernel/hostname` report `NAME` for static and dynamic binaries alike, and replaces `/etc/hostname` and `/etc/hosts` so the name resolves locally.
 - **Preserved User Identity**: Maps the user's real UID/GID inside the namespace, preserving file permissions, home directory access, and shell prompt settings.
 
 ---
@@ -117,7 +118,20 @@ tzspoof tokyo python3 -c "import datetime; print(datetime.datetime.now().astimez
 tzspoof london -- sh -c 'date; cat /etc/timezone; readlink /etc/localtime'
 ```
 
-### 3. Check Current Timezone Status
+### 3. Spoof the Hostname Too
+
+```bash
+# Run a build as if on a different machine:
+tzspoof -H build-01 utc -- sh -c 'hostname; uname -n; getent hosts build-01'
+```
+
+With `-H`, tzspoof also:
+- puts `127.0.1.1 NAME` at the top of `/etc/hosts`, so forward and reverse lookups return the spoofed name;
+- moves `files` to the front of the `hosts:` line in `/etc/nsswitch.conf`. Otherwise modules such as `resolve` (systemd-resolved), which run outside the namespace, answer first with the real host's data.
+
+Limits: `hostnamectl` and other D-Bus clients still ask systemd-hostnamed, which is outside the namespace, and so do `systemd-resolved` lookups made directly over D-Bus. `/etc/hosts` keeps its original lines, so a line that names the real host is still readable. `/etc/machine-id`, IP addresses and reverse DNS still identify the real host. `-H` needs namespaces: it cannot be combined with `-e`, and tzspoof exits with an error instead of falling back if namespace setup fails.
+
+### 4. Check Current Timezone Status
 
 ```bash
 tzspoof -c
@@ -132,7 +146,7 @@ Current Timezone Status:
   • Spoof State : ACTIVE (Target: Asia/Tokyo)
 ```
 
-### 4. Search and List Available Timezones
+### 5. Search and List Available Timezones
 
 ```bash
 # List all timezones matching 'Europe':
@@ -279,6 +293,8 @@ $ exit
 
 ## CLI Options
 
+Options may appear before or right after `<TIMEZONE>` (`tzspoof -s tokyo -H box`). Parsing stops at the first non-option or `--`, so arguments of the command itself are never read as tzspoof options. `-s` together with a command is an error.
+
 | Flag | Long Option | Description |
 |---|---|---|
 | `-s` | `--shell` | Explicitly spawn an interactive shell (default if no command given) |
@@ -287,6 +303,7 @@ $ exit
 | `-q` | `--quiet` | Quiet mode (suppress banners and informational messages) |
 | `-e` | `--env-only` | Skip Linux namespaces; only use `$TZ` and preload hook |
 | `-p` | `--preload` | Force loading of `libtzspoof.so` preload hook |
+| `-H` | `--hostname NAME` | Also spoof the hostname (UTS namespace, `/etc/hostname`, `/etc/hosts`) |
 | `-v` | `--version` | Display version information |
 | `-h` | `--help` | Display help menu |
 

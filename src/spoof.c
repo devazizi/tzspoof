@@ -68,13 +68,94 @@ static bool mount_over(int dfd, const char *path, unsigned int follow_flags, con
     return rc == 0;
 }
 
+#define MAX_ETC_FILE (1024 * 1024)
+
+/* Read a small text file; returns a malloc'd NUL-terminated buffer or NULL. */
+static char *read_small_file(const char *path) {
+    int fd = open(path, O_RDONLY | O_CLOEXEC);
+    if (fd < 0) return NULL;
+    char *buf = malloc(MAX_ETC_FILE + 1);
+    size_t len = 0;
+    ssize_t n = 0;
+    while (buf && len < MAX_ETC_FILE && (n = read(fd, buf + len, MAX_ETC_FILE - len)) > 0) {
+        len += (size_t)n;
+    }
+    close(fd);
+    if (!buf || n < 0) { free(buf); return NULL; }
+    buf[len] = '\0';
+    return buf;
+}
+
+static bool write_scratch(int dir, const char *name, const char *content) {
+    int fd = openat(dir, name, O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC, 0644);
+    if (fd < 0) return false;
+    size_t len = strlen(content);
+    bool ok = write(fd, content, len) == (ssize_t)len;
+    close(fd);
+    return ok;
+}
+
+/*
+ * /etc/hosts with "127.0.1.1 <name>" first, so forward and reverse
+ * lookups of the spoofed name resolve locally (first match wins).
+ */
+static bool write_hosts(int dir, const char *hostname) {
+    char *orig = read_small_file(HOSTS_FILE);
+    if (!orig) return false;
+    char *out = NULL;
+    bool ok = asprintf(&out, "# tzspoof: spoofed hostname\n127.0.1.1\t%s\n%s", hostname, orig) >= 0 &&
+              write_scratch(dir, "hosts", out);
+    free(out);
+    free(orig);
+    return ok;
+}
+
+/*
+ * nsswitch.conf with "files" moved to the front of the hosts: line.
+ * Modules such as "resolve" (systemd-resolved) run outside the namespace
+ * and would answer with the real hostname, or NOTFOUND-and-return for the
+ * spoofed one, before /etc/hosts is ever consulted.
+ */
+static bool write_nsswitch(int dir) {
+    char *orig = read_small_file(NSSWITCH_FILE);
+    if (!orig) return false;
+    size_t cap = strlen(orig) + 16;
+    char *out = calloc(1, cap);
+    if (!out) { free(orig); return false; }
+
+    char *save = NULL;
+    for (char *line = strtok_r(orig, "\n", &save); line; line = strtok_r(NULL, "\n", &save)) {
+        const char *p = line + strspn(line, " \t");
+        if (strncmp(p, "hosts:", 6) != 0) {
+            strcat(out, line);
+            strcat(out, "\n");
+            continue;
+        }
+        strcat(out, "hosts: files");
+        char *tsave = NULL;
+        bool skip_action = false;
+        for (char *tok = strtok_r((char *)p + 6, " \t", &tsave); tok; tok = strtok_r(NULL, " \t", &tsave)) {
+            if (strcmp(tok, "files") == 0) { skip_action = true; continue; }
+            if (skip_action && tok[0] == '[') continue; /* action bound to the old "files" */
+            skip_action = false;
+            strcat(out, " ");
+            strcat(out, tok);
+        }
+        strcat(out, "\n");
+    }
+    bool ok = write_scratch(dir, "nsswitch.conf", out);
+    free(out);
+    free(orig);
+    return ok;
+}
+
 /*
  * Private tmpfs that is never attached anywhere: it only holds the
- * replacement symlink and /etc/timezone content. Nothing touches the
- * host's /tmp, and files are never unlinked (mounting over an unlinked
- * file fails with ENOENT, which broke nested sessions).
+ * replacement files. Nothing touches the host's /tmp, and files are never
+ * unlinked (mounting over an unlinked file fails with ENOENT, which broke
+ * nested sessions). Optional /etc files that do not exist are skipped.
  */
-static int make_scratch_tmpfs(const char *tz_canonical, const char *tz_path) {
+static int make_scratch_tmpfs(const char *tz_canonical, const char *tz_path, const char *hostname) {
     int fs = (int)syscall(SYS_fsopen, "tmpfs", TZS_FSOPEN_CLOEXEC);
     if (fs < 0) return -1;
     if (syscall(SYS_fsconfig, fs, TZS_FSCONFIG_CMD_CREATE, NULL, NULL, 0) != 0) {
@@ -87,10 +168,17 @@ static int make_scratch_tmpfs(const char *tz_canonical, const char *tz_path) {
     if (mnt < 0) { errno = saved; return -1; }
 
     if (symlinkat(tz_path, mnt, "localtime") != 0) goto fail;
-    int fd = openat(mnt, "timezone", O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC, 0644);
-    if (fd < 0) goto fail;
-    dprintf(fd, "%s\n", tz_canonical);
-    close(fd);
+    char line[256];
+    snprintf(line, sizeof(line), "%s\n", tz_canonical);
+    if (!write_scratch(mnt, "timezone", line)) goto fail;
+
+    if (hostname) {
+        snprintf(line, sizeof(line), "%s\n", hostname);
+        if (!write_scratch(mnt, "hostname", line)) goto fail;
+        /* Missing source files only mean there is nothing to replace. */
+        if (!write_hosts(mnt, hostname) && errno != ENOENT) goto fail;
+        if (!write_nsswitch(mnt) && errno != ENOENT) goto fail;
+    }
     return mnt;
 
 fail:
@@ -100,12 +188,26 @@ fail:
     return -1;
 }
 
-bool spoof_setup_namespaces(const char *tz_canonical, const char *tz_path, bool quiet) {
+/* Replace target with scratch/name when both exist; warn (not fatal) on failure. */
+static void replace_optional(int scratch, const char *name, const char *target, bool quiet) {
+    if (faccessat(scratch, name, F_OK, AT_SYMLINK_NOFOLLOW) != 0 ||
+        faccessat(AT_FDCWD, target, F_OK, AT_SYMLINK_NOFOLLOW) != 0) {
+        return;
+    }
+    if (!mount_over(scratch, name, 0, target) && !quiet) {
+        fprintf(stderr, "%s[!] Warning: could not replace %s (%s); it still shows the outer value.%s\n",
+                CLR_YELLOW, target, strerror(errno), CLR_RESET);
+    }
+}
+
+bool spoof_setup_namespaces(const char *tz_canonical, const char *tz_path, const char *hostname,
+                            bool quiet) {
     uid_t uid = getuid();
     gid_t gid = getgid();
 
-    /* Unshare user namespace and mount namespace */
-    if (unshare(CLONE_NEWUSER | CLONE_NEWNS) == -1) {
+    /* Unshare user and mount namespaces (plus UTS when spoofing the hostname) */
+    int flags = CLONE_NEWUSER | CLONE_NEWNS | (hostname ? CLONE_NEWUTS : 0);
+    if (unshare(flags) == -1) {
         return false;
     }
 
@@ -125,12 +227,17 @@ bool spoof_setup_namespaces(const char *tz_canonical, const char *tz_path, bool 
         return false;
     }
 
+    /* The kernel hostname: uname(2), gethostname(), /proc/sys/kernel/hostname */
+    if (hostname && sethostname(hostname, strlen(hostname)) != 0) {
+        return false;
+    }
+
     /* Make root mount hierarchy private so our bind mounts do not leak */
     if (mount("none", "/", NULL, MS_REC | MS_PRIVATE, NULL) == -1) {
         return false;
     }
 
-    int scratch = make_scratch_tmpfs(tz_canonical, tz_path);
+    int scratch = make_scratch_tmpfs(tz_canonical, tz_path, hostname);
     if (scratch < 0) return false;
 
     /*
@@ -159,11 +266,12 @@ bool spoof_setup_namespaces(const char *tz_canonical, const char *tz_path, bool 
         return false;
     }
 
-    /* /etc/timezone is optional (Debian-family); only replace it if present. */
-    if (faccessat(AT_FDCWD, TIMEZONE_FILE, F_OK, AT_SYMLINK_NOFOLLOW) == 0 &&
-        !mount_over(scratch, "timezone", 0, TIMEZONE_FILE) && !quiet) {
-        fprintf(stderr, "%s[!] Warning: could not replace %s (%s); it still shows the outer zone.%s\n",
-                CLR_YELLOW, TIMEZONE_FILE, strerror(errno), CLR_RESET);
+    /* Optional files; /etc/timezone exists mainly on Debian-family hosts. */
+    replace_optional(scratch, "timezone", TIMEZONE_FILE, quiet);
+    if (hostname) {
+        replace_optional(scratch, "hostname", HOSTNAME_FILE, quiet);
+        replace_optional(scratch, "hosts", HOSTS_FILE, quiet);
+        replace_optional(scratch, "nsswitch.conf", NSSWITCH_FILE, quiet);
     }
 
     close(scratch);
@@ -203,11 +311,18 @@ static bool find_preload_lib(char *dest, size_t dest_size) {
     return false;
 }
 
-bool spoof_setup_environment(const char *tz_canonical, const char *tz_path, bool force_preload) {
+bool spoof_setup_environment(const char *tz_canonical, const char *tz_path, const char *hostname,
+                             bool force_preload) {
     setenv("TZ", tz_canonical, 1);
     setenv("TZSPOOF_ACTIVE", "1", 1);
     setenv("TZSPOOF_ZONE", tz_canonical, 1);
     setenv("TZSPOOF_TARGET_PATH", tz_path, 1);
+    if (hostname) {
+        setenv("TZSPOOF_HOSTNAME", hostname, 1);
+        /* Shells export HOSTNAME/HOST; refresh inherited copies. */
+        setenv("HOSTNAME", hostname, 1);
+        setenv("HOST", hostname, 1);
+    }
 
     char lib_path[512] = {0};
     if (find_preload_lib(lib_path, sizeof(lib_path))) {
@@ -241,7 +356,7 @@ int spoof_execute(const tz_config_t *config, const tz_info_t *info, bool userns_
         }
 
         if (!config->quiet) {
-            tz_print_banner(info, shell, userns_active);
+            tz_print_banner(info, config->hostname[0] ? config->hostname : NULL, shell, userns_active);
         }
 
         char *shell_args[] = { (char *)shell, NULL };

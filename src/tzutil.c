@@ -378,7 +378,8 @@ static void print_row(const char *label, const char *val, const char *color) {
     printf("%s│%s\n", CLR_CYAN, CLR_RESET);
 }
 
-void tz_print_banner(const tz_info_t *info, const char *shell_path, bool userns_active) {
+void tz_print_banner(const tz_info_t *info, const char *hostname, const char *shell_path,
+                     bool userns_active) {
     bool tty = isatty(STDOUT_FILENO);
 
     if (tty) {
@@ -399,6 +400,7 @@ void tz_print_banner(const tz_info_t *info, const char *shell_path, bool userns_
 
         print_row("• Target Zone : ", info->canonical, CLR_BOLD);
         print_row("• Local Time  : ", line_time, CLR_YELLOW);
+        if (hostname) print_row("• Hostname    : ", hostname, CLR_BOLD);
         print_row("• Isolation   : ", iso_text, CLR_BLUE);
         print_row("• Subshell    : ", shell_path, CLR_MAGENTA);
 
@@ -408,7 +410,8 @@ void tz_print_banner(const tz_info_t *info, const char *shell_path, bool userns_
         printf("%s╰────────────────────────────────────────────────────────────────────────╯%s\n\n",
                CLR_CYAN, CLR_RESET);
     } else {
-        fprintf(stderr, "[*] tzspoof: Target Zone: %s (%s, UTC%s)\n",
-                info->canonical, info->tz_abbr, info->utc_offset);
+        fprintf(stderr, "[*] tzspoof: Target Zone: %s (%s, UTC%s)%s%s\n",
+                info->canonical, info->tz_abbr, info->utc_offset,
+                hostname ? ", Hostname: " : "", hostname ? hostname : "");
     }
 }

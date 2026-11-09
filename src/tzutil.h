@@ -16,6 +16,7 @@ void tz_list(const char *filter);
 bool tz_get_current(tz_info_t *info);
 
 /* Render nice terminal banner */
-void tz_print_banner(const tz_info_t *info, const char *shell_path, bool userns_active);
+void tz_print_banner(const tz_info_t *info, const char *hostname, const char *shell_path,
+                     bool userns_active);
 
 #endif /* TZUTIL_H */

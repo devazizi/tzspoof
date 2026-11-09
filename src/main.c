@@ -2,6 +2,27 @@
 #include "tzutil.h"
 #include "spoof.h"
 #include <getopt.h>
+#include <ctype.h>
+
+/* RFC 1123 hostname: dot-separated labels of [A-Za-z0-9-], 1-63 chars each,
+ * no leading/trailing hyphen, at most 64 chars total (Linux HOST_NAME_MAX). */
+static bool valid_hostname(const char *name) {
+    size_t len = strlen(name);
+    if (len == 0 || len > TZS_HOST_NAME_MAX) return false;
+    size_t label = 0;
+    for (size_t i = 0; i <= len; i++) {
+        char c = name[i];
+        if (c == '.' || c == '\0') {
+            if (label == 0 || name[i - 1] == '-') return false;
+            label = 0;
+            continue;
+        }
+        if (!isalnum((unsigned char)c) && c != '-') return false;
+        if (c == '-' && label == 0) return false;
+        if (++label > 63) return false;
+    }
+    return true;
+}
 
 static void print_version(void) {
     printf("tzspoof version %s (Linux namespaces & environment spoofing engine)\n", TZSPOOF_VERSION);
@@ -12,7 +33,7 @@ static void print_help(const char *progname) {
            CLR_BOLD, CLR_CYAN, TZSPOOF_VERSION, CLR_RESET);
 
     printf("%sUSAGE:%s\n", CLR_BOLD, CLR_RESET);
-    printf("  %s [OPTIONS] <TIMEZONE> [--] [COMMAND [ARGS...]]\n", progname);
+    printf("  %s [OPTIONS] <TIMEZONE> [OPTIONS] [--] [COMMAND [ARGS...]]\n", progname);
     printf("  %s -l, --list [FILTER]\n", progname);
     printf("  %s -c, --current\n", progname);
     printf("  %s -h, --help\n\n", progname);
@@ -43,6 +64,9 @@ static void print_help(const char *progname) {
            CLR_GREEN, CLR_RESET);
     printf("  %s-p, --preload%s           Force loading of libtzspoof.so preload hook\n",
            CLR_GREEN, CLR_RESET);
+    printf("  %s-H, --hostname NAME%s     Also spoof the hostname (UTS namespace, /etc/hostname,\n"
+           "                         /etc/hosts); not available with --env-only\n",
+           CLR_GREEN, CLR_RESET);
     printf("  %s-v, --version%s           Show version information\n",
            CLR_GREEN, CLR_RESET);
     printf("  %s-h, --help%s              Show this help menu\n\n",
@@ -58,6 +82,8 @@ static void print_help(const char *progname) {
     printf("  $ %s tokyo\n\n", progname);
     printf("  # Run a specific command in London timezone:\n");
     printf("  $ %s london date\n\n", progname);
+    printf("  # Run a command with a spoofed timezone and hostname:\n");
+    printf("  $ %s -H build-01 utc hostname\n\n", progname);
     printf("  # Run a python script in New York timezone:\n");
     printf("  $ %s ny python3 -c \"import time; print(time.tzname)\"\n\n", progname);
     printf("  # Search available European timezones:\n");
@@ -82,33 +108,39 @@ static void show_current(void) {
     if (active && strcmp(active, "1") == 0) {
         const char *zone = getenv("TZSPOOF_ZONE");
         printf("  • Spoof State : %sACTIVE%s (Target: %s)\n", CLR_GREEN, CLR_RESET, zone ? zone : "unknown");
+        const char *host = getenv("TZSPOOF_HOSTNAME");
+        if (host) printf("  • Hostname    : %s%s%s (spoofed)\n", CLR_BOLD, host, CLR_RESET);
     } else {
         printf("  • Spoof State : %sINACTIVE%s (Native Host)\n", CLR_DIM, CLR_RESET);
     }
     printf("\n");
 }
 
-int main(int argc, char *argv[]) {
-    tz_config_t config;
-    memset(&config, 0, sizeof(config));
+static const struct option long_options[] = {
+    {"help",       no_argument,       0, 'h'},
+    {"version",    no_argument,       0, 'v'},
+    {"list",       optional_argument, 0, 'l'},
+    {"current",    no_argument,       0, 'c'},
+    {"shell",      no_argument,       0, 's'},
+    {"quiet",      no_argument,       0, 'q'},
+    {"env-only",   no_argument,       0, 'e'},
+    {"preload",    no_argument,       0, 'p'},
+    {"hostname",   required_argument, 0, 'H'},
+    {0, 0, 0, 0}
+};
 
-    static struct option long_options[] = {
-        {"help",       no_argument,       0, 'h'},
-        {"version",    no_argument,       0, 'v'},
-        {"list",       optional_argument, 0, 'l'},
-        {"current",    no_argument,       0, 'c'},
-        {"shell",      no_argument,       0, 's'},
-        {"quiet",      no_argument,       0, 'q'},
-        {"env-only",   no_argument,       0, 'e'},
-        {"preload",    no_argument,       0, 'p'},
-        {0, 0, 0, 0}
-    };
-
+/*
+ * Parse options from argv[1..] up to the first non-option or "--".
+ * Returns -1 to continue, otherwise the exit code (e.g. for -h, -l).
+ * On return *next is the index of the first unparsed argument.
+ */
+static int parse_options(int argc, char *argv[], const char *progname, tz_config_t *config, int *next) {
     int opt;
-    while ((opt = getopt_long(argc, argv, "+hvcl::sqep", long_options, NULL)) != -1) {
+    optind = 0; /* full getopt reset: this runs on two different argv slices */
+    while ((opt = getopt_long(argc, argv, "+hvcl::sqepH:", long_options, NULL)) != -1) {
         switch (opt) {
             case 'h':
-                print_help(argv[0]);
+                print_help(progname);
                 return 0;
             case 'v':
                 print_version();
@@ -125,41 +157,79 @@ int main(int argc, char *argv[]) {
                 show_current();
                 return 0;
             case 's':
-                config.interactive_shell = true;
+                config->interactive_shell = true;
                 break;
             case 'q':
-                config.quiet = true;
+                config->quiet = true;
                 break;
             case 'e':
-                config.env_only = true;
+                config->env_only = true;
                 break;
             case 'p':
-                config.force_preload = true;
+                config->force_preload = true;
+                break;
+            case 'H':
+                if (!valid_hostname(optarg)) {
+                    fprintf(stderr, "%s[-] Error: invalid hostname '%s' (letters, digits, '-' and '.'; "
+                            "max 64 chars, 63 per label).%s\n", CLR_RED, optarg, CLR_RESET);
+                    return 1;
+                }
+                strncpy(config->hostname, optarg, sizeof(config->hostname) - 1);
                 break;
             default:
-                print_help(argv[0]);
+                print_help(progname);
                 return 1;
         }
     }
+    *next = optind;
+    return -1;
+}
 
-    if (optind >= argc) {
+int main(int argc, char *argv[]) {
+    tz_config_t config;
+    memset(&config, 0, sizeof(config));
+
+    /* Pass 1: options before TIMEZONE. */
+    int next = 1;
+    int rc = parse_options(argc, argv, argv[0], &config, &next);
+    if (rc >= 0) return rc;
+
+    if (next >= argc) {
         fprintf(stderr, "%s[-] Error: Target timezone required.%s\n\n", CLR_RED, CLR_RESET);
         print_help(argv[0]);
         return 1;
     }
 
-    const char *target_tz = argv[optind++];
-    strncpy(config.target_zone, target_tz, sizeof(config.target_zone) - 1);
+    const int tz_index = next;
+    strncpy(config.target_zone, argv[tz_index], sizeof(config.target_zone) - 1);
 
-    /* Check if remaining arguments exist */
-    if (optind < argc) {
-        if (strcmp(argv[optind], "--") == 0) {
-            optind++;
-        }
-        if (optind < argc) {
-            config.cmd_argv = &argv[optind];
-            config.cmd_argc = argc - optind;
-        }
+    /*
+     * Pass 2: options right after TIMEZONE (e.g. "tzspoof -s tokyo -H box").
+     * Parsing stops at the first non-option or "--", so command arguments
+     * such as "python3 -c ..." are never treated as tzspoof options.
+     * argv[tz_index] stands in as argv[0] for this slice.
+     */
+    rc = parse_options(argc - tz_index, &argv[tz_index], argv[0], &config, &next);
+    if (rc >= 0) return rc;
+    next += tz_index;
+
+    if (next < argc) {
+        config.cmd_argv = &argv[next];
+        config.cmd_argc = argc - next;
+    }
+
+    if (config.interactive_shell && config.cmd_argc > 0) {
+        fprintf(stderr, "%s[-] Error: --shell cannot be combined with a command ('%s'). "
+                "Put tzspoof options before the command, or use '--' before a command.%s\n",
+                CLR_RED, config.cmd_argv[0], CLR_RESET);
+        return 1;
+    }
+
+    const char *hostname = config.hostname[0] ? config.hostname : NULL;
+    if (hostname && config.env_only) {
+        fprintf(stderr, "%s[-] Error: --hostname needs namespaces and cannot be used with --env-only.%s\n",
+                CLR_RED, CLR_RESET);
+        return 1;
     }
 
     /* Resolve timezone */
@@ -177,8 +247,13 @@ int main(int argc, char *argv[]) {
     /* Setup namespaces if not env-only */
     bool userns_active = false;
     if (!config.env_only) {
-        if (spoof_setup_namespaces(info.canonical, info.full_path, config.quiet)) {
+        if (spoof_setup_namespaces(info.canonical, info.full_path, hostname, config.quiet)) {
             userns_active = true;
+        } else if (hostname) {
+            /* No environment-only fallback can change the hostname: fail loudly. */
+            fprintf(stderr, "%s[-] Error: cannot spoof hostname, namespace setup failed (%s).%s\n",
+                    CLR_RED, strerror(errno), CLR_RESET);
+            return 1;
         } else {
             if (!config.quiet) {
                 fprintf(stderr, "%s[!] Warning: Linux namespace isolation unavailable (%s); falling back to environment mode.%s\n",
@@ -188,7 +263,7 @@ int main(int argc, char *argv[]) {
     }
 
     /* Setup environment variables and LD_PRELOAD */
-    spoof_setup_environment(info.canonical, info.full_path, config.force_preload);
+    spoof_setup_environment(info.canonical, info.full_path, hostname, config.force_preload);
 
     /* Execute shell or command */
     return spoof_execute(&config, &info, userns_active);

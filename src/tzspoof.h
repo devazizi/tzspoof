@@ -19,6 +19,10 @@
 #define ZONEINFO_DIR    "/usr/share/zoneinfo"
 #define LOCALTIME_FILE  "/etc/localtime"
 #define TIMEZONE_FILE   "/etc/timezone"
+#define HOSTNAME_FILE   "/etc/hostname"
+#define HOSTS_FILE      "/etc/hosts"
+#define NSSWITCH_FILE   "/etc/nsswitch.conf"
+#define TZS_HOST_NAME_MAX 64
 
 /* ANSI Colors */
 #define CLR_RESET   "\033[0m"
@@ -43,6 +47,7 @@ typedef struct {
 
 typedef struct {
     char target_zone[128];
+    char hostname[TZS_HOST_NAME_MAX + 1]; /* empty: keep the real hostname */
     bool interactive_shell;
     bool quiet;
     bool env_only;
