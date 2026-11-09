@@ -177,7 +177,7 @@ int main(int argc, char *argv[]) {
     /* Setup namespaces if not env-only */
     bool userns_active = false;
     if (!config.env_only) {
-        if (spoof_setup_namespaces(info.canonical, info.full_path)) {
+        if (spoof_setup_namespaces(info.canonical, info.full_path, config.quiet)) {
             userns_active = true;
         } else {
             if (!config.quiet) {

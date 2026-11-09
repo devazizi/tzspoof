@@ -50,7 +50,7 @@ A lightweight, zero-dependency, high-fidelity **Timezone Spoofing Utility** for 
 
 ### Requirements
 
-- Linux Kernel ≥ 3.8 (with user namespaces enabled, default on modern distributions)
+- Linux Kernel ≥ 5.2 (unprivileged user namespaces and the `open_tree`/`move_mount` mount API); on older kernels tzspoof falls back to environment mode (`-e`)
 - GCC or Clang
 - Make
 
@@ -70,6 +70,8 @@ This produces:
 ```bash
 make test
 ```
+
+`make test` includes `tests/test_tzspoof.py` (Python >= 3.12), which runs `bin/tzspoof` in a throwaway namespace with a fake `/etc` to cover symlinked and regular-file `/etc/localtime` hosts and nested sessions.
 
 ### Install (Optional)
 

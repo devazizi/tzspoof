@@ -366,6 +366,18 @@ bool tz_get_current(tz_info_t *info) {
     return tz_populate_info("System Default", LOCALTIME_FILE, info);
 }
 
+/* Banner row with exact 72-column inner padding (a plain static function:
+ * GCC nested functions do not compile with Clang). */
+static void print_row(const char *label, const char *val, const char *color) {
+    int vis_len = 2 + (int)strlen(label) + (int)strlen(val);
+    if (strstr(label, "•")) vis_len -= 2; /* Adjust for 3-byte UTF-8 bullet occupying 1 column */
+    int pad = 72 - vis_len;
+    if (pad < 1) pad = 1;
+    printf("%s│%s  %s%s%s%s", CLR_CYAN, CLR_RESET, label, color, val, CLR_RESET);
+    for (int p = 0; p < pad; p++) putchar(' ');
+    printf("%s│%s\n", CLR_CYAN, CLR_RESET);
+}
+
 void tz_print_banner(const tz_info_t *info, const char *shell_path, bool userns_active) {
     bool tty = isatty(STDOUT_FILENO);
 
@@ -381,19 +393,7 @@ void tz_print_banner(const tz_info_t *info, const char *shell_path, bool userns_
         printf("\n%s╭────────────────────────────────────────────────────────────────────────╮%s\n",
                CLR_CYAN, CLR_RESET);
 
-        /* Helper for formatted rows with exact 72-char inner padding */
-        auto void print_row(const char *label, const char *val, const char *color);
-        void print_row(const char *label, const char *val, const char *color) {
-            int vis_len = 2 + (int)strlen(label) + (int)strlen(val);
-            if (strstr(label, "•")) vis_len -= 2; /* Adjust for 3-byte UTF-8 bullet occupying 1 column */
-            int pad = 72 - vis_len;
-            if (pad < 1) pad = 1;
-            printf("%s│%s  %s%s%s%s", CLR_CYAN, CLR_RESET, label, color, val, CLR_RESET);
-            for (int p = 0; p < pad; p++) putchar(' ');
-            printf("%s│%s\n", CLR_CYAN, CLR_RESET);
-        }
-
-        print_row("tzspoof v1.0.0 - Timezone Spoofing Active", "", CLR_BOLD CLR_GREEN);
+        print_row("tzspoof v" TZSPOOF_VERSION " - Timezone Spoofing Active", "", CLR_BOLD CLR_GREEN);
         printf("%s├────────────────────────────────────────────────────────────────────────┤%s\n",
                CLR_CYAN, CLR_RESET);
 

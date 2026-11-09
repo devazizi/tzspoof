@@ -58,6 +58,8 @@ test: all
 	@if command -v ssh >/dev/null 2>&1; then \
 		./$(TARGET) -q tokyo ssh -G localhost >/dev/null 2>&1 && echo "  [PASS] OpenSSH config check"; \
 	fi
+	@echo "Test 7: Hermetic namespace regression tests"
+	@python3 -I tests/test_tzspoof.py
 	@echo "All tests passed successfully!"
 
 install: all

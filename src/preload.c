@@ -1,7 +1,12 @@
 #ifndef _GNU_SOURCE
 #define _GNU_SOURCE
 #endif
+/* glibc declares path arguments nonnull; the NULL guards are kept anyway. */
+#if defined(__clang__)
+#pragma clang diagnostic ignored "-Wpointer-bool-conversion"
+#else
 #pragma GCC diagnostic ignored "-Wnonnull-compare"
+#endif
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -52,6 +57,30 @@ static int (*real_fxstatat64)(int, int, const char *, struct stat64 *, int) = NU
 
 static int (*real_statx)(int, const char *, int, unsigned int, struct statx *) = NULL;
 
+/*
+ * Inside an unprivileged user namespace, host root (and every other
+ * unmapped ID) shows up as the overflow ID 65534. Tools such as ssh
+ * reject root-owned config files that appear owned by "nobody", so the
+ * hooks report 65534 as 0 there. Outside a user namespace (e.g. -e mode)
+ * a 65534 owner is genuine and is passed through unchanged.
+ */
+static int in_userns = 0;
+
+static void detect_userns(void) {
+    /* The initial namespace maps the full range: "0 0 4294967295". */
+    int fd = real_open ? real_open("/proc/self/uid_map", O_RDONLY | O_CLOEXEC) : -1;
+    if (fd < 0) return;
+    char buf[128] = {0};
+    ssize_t n = read(fd, buf, sizeof(buf) - 1);
+    close(fd);
+    if (n <= 0) return;
+    unsigned long inside, outside, count;
+    if (sscanf(buf, "%lu %lu %lu", &inside, &outside, &count) == 3 &&
+        !(inside == 0 && outside == 0 && count == 4294967295UL)) {
+        in_userns = 1;
+    }
+}
+
 static void init_hooks(void) {
     static int initialized = 0;
     if (initialized) return;
@@ -86,31 +115,36 @@ static void init_hooks(void) {
     if (!real_fxstatat64)     real_fxstatat64     = dlsym(RTLD_NEXT, "__fxstatat64");
 
     if (!real_statx)          real_statx          = dlsym(RTLD_NEXT, "statx");
+
+    detect_userns();
 }
 
-/* Helper to map overflow UID/GID (nobody/65534) to root (0) inside unprivileged user namespace */
 static inline void fix_stat_buf(struct stat *buf) {
-    if (buf) {
+    if (buf && in_userns) {
         if (buf->st_uid == 65534) buf->st_uid = 0;
         if (buf->st_gid == 65534) buf->st_gid = 0;
     }
 }
 
 static inline void fix_stat64_buf(struct stat64 *buf) {
-    if (buf) {
+    if (buf && in_userns) {
         if (buf->st_uid == 65534) buf->st_uid = 0;
         if (buf->st_gid == 65534) buf->st_gid = 0;
     }
 }
 
 static inline void fix_statx_buf(struct statx *buf) {
-    if (buf) {
+    if (buf && in_userns) {
         if (buf->stx_uid == 65534) buf->stx_uid = 0;
         if (buf->stx_gid == 65534) buf->stx_gid = 0;
     }
 }
 
-/* Helper to spoof readlink buffer */
+/*
+ * Helper to spoof readlink buffer. Callers use it only after the real
+ * readlink succeeded, so a regular-file /etc/localtime keeps returning
+ * EINVAL and stays consistent with lstat().
+ */
 static ssize_t do_spoof_readlink(char *buf, size_t bufsiz) {
     const char *target = getenv("TZSPOOF_TARGET_PATH");
     if (!target || !*target) return -1;
@@ -123,45 +157,50 @@ static ssize_t do_spoof_readlink(char *buf, size_t bufsiz) {
 
 ssize_t readlink(const char *pathname, char *buf, size_t bufsiz) {
     init_hooks();
-    if (pathname && strcmp(pathname, "/etc/localtime") == 0) {
-        ssize_t res = do_spoof_readlink(buf, bufsiz);
-        if (res >= 0) return res;
+    ssize_t res = real_readlink ? real_readlink(pathname, buf, bufsiz) : -1;
+    if (res >= 0 && pathname && strcmp(pathname, "/etc/localtime") == 0) {
+        ssize_t spoofed = do_spoof_readlink(buf, bufsiz);
+        if (spoofed >= 0) return spoofed;
     }
-    return real_readlink ? real_readlink(pathname, buf, bufsiz) : -1;
+    return res;
 }
 
 ssize_t __readlink_chk(const char *pathname, char *buf, size_t bufsiz, size_t buflen) {
     init_hooks();
-    if (pathname && strcmp(pathname, "/etc/localtime") == 0) {
-        ssize_t res = do_spoof_readlink(buf, bufsiz);
-        if (res >= 0) return res;
+    ssize_t res = real_readlink_chk ? real_readlink_chk(pathname, buf, bufsiz, buflen) : -1;
+    if (res >= 0 && pathname && strcmp(pathname, "/etc/localtime") == 0) {
+        ssize_t spoofed = do_spoof_readlink(buf, bufsiz);
+        if (spoofed >= 0) return spoofed;
     }
-    return real_readlink_chk ? real_readlink_chk(pathname, buf, bufsiz, buflen) : -1;
+    return res;
 }
 
 ssize_t readlinkat(int dirfd, const char *pathname, char *buf, size_t bufsiz) {
     init_hooks();
-    if (pathname && strcmp(pathname, "/etc/localtime") == 0) {
-        ssize_t res = do_spoof_readlink(buf, bufsiz);
-        if (res >= 0) return res;
+    ssize_t res = real_readlinkat ? real_readlinkat(dirfd, pathname, buf, bufsiz) : -1;
+    if (res >= 0 && pathname && strcmp(pathname, "/etc/localtime") == 0) {
+        ssize_t spoofed = do_spoof_readlink(buf, bufsiz);
+        if (spoofed >= 0) return spoofed;
     }
-    return real_readlinkat ? real_readlinkat(dirfd, pathname, buf, bufsiz) : -1;
+    return res;
 }
 
 ssize_t __readlinkat_chk(int dirfd, const char *pathname, char *buf, size_t bufsiz, size_t buflen) {
     init_hooks();
-    if (pathname && strcmp(pathname, "/etc/localtime") == 0) {
-        ssize_t res = do_spoof_readlink(buf, bufsiz);
-        if (res >= 0) return res;
+    ssize_t res = real_readlinkat_chk ? real_readlinkat_chk(dirfd, pathname, buf, bufsiz, buflen) : -1;
+    if (res >= 0 && pathname && strcmp(pathname, "/etc/localtime") == 0) {
+        ssize_t spoofed = do_spoof_readlink(buf, bufsiz);
+        if (spoofed >= 0) return spoofed;
     }
-    return real_readlinkat_chk ? real_readlinkat_chk(dirfd, pathname, buf, bufsiz, buflen) : -1;
+    return res;
 }
 
 /* Open hooks fallback for environments without namespaces */
 int open(const char *pathname, int flags, ...) {
     init_hooks();
     mode_t mode = 0;
-    if (flags & (O_CREAT | O_TMPFILE)) {
+    /* O_TMPFILE includes O_DIRECTORY, so test the whole mask. */
+    if ((flags & O_CREAT) || (flags & O_TMPFILE) == O_TMPFILE) {
         va_list args;
         va_start(args, flags);
         mode = (mode_t)va_arg(args, int);
@@ -169,7 +208,7 @@ int open(const char *pathname, int flags, ...) {
     }
 
     const char *target = getenv("TZSPOOF_TARGET_PATH");
-    if (target && pathname && strcmp(pathname, "/etc/localtime") == 0) {
+    if (target && !(flags & O_NOFOLLOW) && pathname && strcmp(pathname, "/etc/localtime") == 0) {
         pathname = target;
     }
 
@@ -179,7 +218,8 @@ int open(const char *pathname, int flags, ...) {
 int open64(const char *pathname, int flags, ...) {
     init_hooks();
     mode_t mode = 0;
-    if (flags & (O_CREAT | O_TMPFILE)) {
+    /* O_TMPFILE includes O_DIRECTORY, so test the whole mask. */
+    if ((flags & O_CREAT) || (flags & O_TMPFILE) == O_TMPFILE) {
         va_list args;
         va_start(args, flags);
         mode = (mode_t)va_arg(args, int);
@@ -187,7 +227,7 @@ int open64(const char *pathname, int flags, ...) {
     }
 
     const char *target = getenv("TZSPOOF_TARGET_PATH");
-    if (target && pathname && strcmp(pathname, "/etc/localtime") == 0) {
+    if (target && !(flags & O_NOFOLLOW) && pathname && strcmp(pathname, "/etc/localtime") == 0) {
         pathname = target;
     }
 
@@ -197,7 +237,8 @@ int open64(const char *pathname, int flags, ...) {
 int openat(int dirfd, const char *pathname, int flags, ...) {
     init_hooks();
     mode_t mode = 0;
-    if (flags & (O_CREAT | O_TMPFILE)) {
+    /* O_TMPFILE includes O_DIRECTORY, so test the whole mask. */
+    if ((flags & O_CREAT) || (flags & O_TMPFILE) == O_TMPFILE) {
         va_list args;
         va_start(args, flags);
         mode = (mode_t)va_arg(args, int);
@@ -205,7 +246,7 @@ int openat(int dirfd, const char *pathname, int flags, ...) {
     }
 
     const char *target = getenv("TZSPOOF_TARGET_PATH");
-    if (target && pathname && strcmp(pathname, "/etc/localtime") == 0) {
+    if (target && !(flags & O_NOFOLLOW) && pathname && strcmp(pathname, "/etc/localtime") == 0) {
         pathname = target;
         dirfd = AT_FDCWD;
     }
@@ -216,7 +257,8 @@ int openat(int dirfd, const char *pathname, int flags, ...) {
 int openat64(int dirfd, const char *pathname, int flags, ...) {
     init_hooks();
     mode_t mode = 0;
-    if (flags & (O_CREAT | O_TMPFILE)) {
+    /* O_TMPFILE includes O_DIRECTORY, so test the whole mask. */
+    if ((flags & O_CREAT) || (flags & O_TMPFILE) == O_TMPFILE) {
         va_list args;
         va_start(args, flags);
         mode = (mode_t)va_arg(args, int);
@@ -224,7 +266,7 @@ int openat64(int dirfd, const char *pathname, int flags, ...) {
     }
 
     const char *target = getenv("TZSPOOF_TARGET_PATH");
-    if (target && pathname && strcmp(pathname, "/etc/localtime") == 0) {
+    if (target && !(flags & O_NOFOLLOW) && pathname && strcmp(pathname, "/etc/localtime") == 0) {
         pathname = target;
         dirfd = AT_FDCWD;
     }
@@ -257,10 +299,6 @@ int stat64(const char *pathname, struct stat64 *buf) {
 
 int lstat(const char *pathname, struct stat *buf) {
     init_hooks();
-    const char *target = getenv("TZSPOOF_TARGET_PATH");
-    if (target && pathname && strcmp(pathname, "/etc/localtime") == 0) {
-        pathname = target;
-    }
     int res = real_lstat ? real_lstat(pathname, buf) : -1;
     if (res == 0) fix_stat_buf(buf);
     return res;
@@ -268,10 +306,6 @@ int lstat(const char *pathname, struct stat *buf) {
 
 int lstat64(const char *pathname, struct stat64 *buf) {
     init_hooks();
-    const char *target = getenv("TZSPOOF_TARGET_PATH");
-    if (target && pathname && strcmp(pathname, "/etc/localtime") == 0) {
-        pathname = target;
-    }
     int res = real_lstat64 ? real_lstat64(pathname, buf) : -1;
     if (res == 0) fix_stat64_buf(buf);
     return res;
@@ -294,7 +328,7 @@ int fstat64(int fd, struct stat64 *buf) {
 int fstatat(int dirfd, const char *pathname, struct stat *buf, int flags) {
     init_hooks();
     const char *target = getenv("TZSPOOF_TARGET_PATH");
-    if (target && pathname && strcmp(pathname, "/etc/localtime") == 0) {
+    if (target && !(flags & AT_SYMLINK_NOFOLLOW) && pathname && strcmp(pathname, "/etc/localtime") == 0) {
         pathname = target;
         dirfd = AT_FDCWD;
     }
@@ -306,7 +340,7 @@ int fstatat(int dirfd, const char *pathname, struct stat *buf, int flags) {
 int fstatat64(int dirfd, const char *pathname, struct stat64 *buf, int flags) {
     init_hooks();
     const char *target = getenv("TZSPOOF_TARGET_PATH");
-    if (target && pathname && strcmp(pathname, "/etc/localtime") == 0) {
+    if (target && !(flags & AT_SYMLINK_NOFOLLOW) && pathname && strcmp(pathname, "/etc/localtime") == 0) {
         pathname = target;
         dirfd = AT_FDCWD;
     }
@@ -339,10 +373,6 @@ int __xstat64(int ver, const char *pathname, struct stat64 *buf) {
 
 int __lxstat(int ver, const char *pathname, struct stat *buf) {
     init_hooks();
-    const char *target = getenv("TZSPOOF_TARGET_PATH");
-    if (target && pathname && strcmp(pathname, "/etc/localtime") == 0) {
-        pathname = target;
-    }
     int res = real_lxstat ? real_lxstat(ver, pathname, buf) : -1;
     if (res == 0) fix_stat_buf(buf);
     return res;
@@ -350,10 +380,6 @@ int __lxstat(int ver, const char *pathname, struct stat *buf) {
 
 int __lxstat64(int ver, const char *pathname, struct stat64 *buf) {
     init_hooks();
-    const char *target = getenv("TZSPOOF_TARGET_PATH");
-    if (target && pathname && strcmp(pathname, "/etc/localtime") == 0) {
-        pathname = target;
-    }
     int res = real_lxstat64 ? real_lxstat64(ver, pathname, buf) : -1;
     if (res == 0) fix_stat64_buf(buf);
     return res;
@@ -376,7 +402,7 @@ int __fxstat64(int ver, int fd, struct stat64 *buf) {
 int __fxstatat(int ver, int dirfd, const char *pathname, struct stat *buf, int flags) {
     init_hooks();
     const char *target = getenv("TZSPOOF_TARGET_PATH");
-    if (target && pathname && strcmp(pathname, "/etc/localtime") == 0) {
+    if (target && !(flags & AT_SYMLINK_NOFOLLOW) && pathname && strcmp(pathname, "/etc/localtime") == 0) {
         pathname = target;
         dirfd = AT_FDCWD;
     }
@@ -388,7 +414,7 @@ int __fxstatat(int ver, int dirfd, const char *pathname, struct stat *buf, int f
 int __fxstatat64(int ver, int dirfd, const char *pathname, struct stat64 *buf, int flags) {
     init_hooks();
     const char *target = getenv("TZSPOOF_TARGET_PATH");
-    if (target && pathname && strcmp(pathname, "/etc/localtime") == 0) {
+    if (target && !(flags & AT_SYMLINK_NOFOLLOW) && pathname && strcmp(pathname, "/etc/localtime") == 0) {
         pathname = target;
         dirfd = AT_FDCWD;
     }
@@ -400,7 +426,7 @@ int __fxstatat64(int ver, int dirfd, const char *pathname, struct stat64 *buf, i
 int statx(int dirfd, const char *pathname, int flags, unsigned int mask, struct statx *buf) {
     init_hooks();
     const char *target = getenv("TZSPOOF_TARGET_PATH");
-    if (target && pathname && strcmp(pathname, "/etc/localtime") == 0) {
+    if (target && !(flags & AT_SYMLINK_NOFOLLOW) && pathname && strcmp(pathname, "/etc/localtime") == 0) {
         pathname = target;
         dirfd = AT_FDCWD;
     }
