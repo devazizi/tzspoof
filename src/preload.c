@@ -74,10 +74,21 @@ static void detect_userns(void) {
     ssize_t n = read(fd, buf, sizeof(buf) - 1);
     close(fd);
     if (n <= 0) return;
-    unsigned long inside, outside, count;
-    if (sscanf(buf, "%lu %lu %lu", &inside, &outside, &count) == 3 &&
-        !(inside == 0 && outside == 0 && count == 4294967295UL)) {
-        in_userns = 1;
+    /*
+     * Compare tokens as strings: sscanf/strtoul resolve to the
+     * __isoc23_* symbols (GLIBC_2.38) on new toolchains, which breaks
+     * programs that bundle an older libc (e.g. staticx binaries).
+     */
+    static const char *const init_map[] = {"0", "0", "4294967295"};
+    char *p = buf;
+    for (int i = 0; i < 3; i++) {
+        p += strspn(p, " \t");
+        size_t len = strcspn(p, " \t\n");
+        if (len != strlen(init_map[i]) || strncmp(p, init_map[i], len) != 0) {
+            in_userns = 1;
+            return;
+        }
+        p += len;
     }
 }
 
