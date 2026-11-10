@@ -169,9 +169,11 @@ class HostnameTest(unittest.TestCase):
 
     def test_spoofed_name_resolves_forward_and_reverse(self):
         out = lines(sandbox(
-            "$T -q -H build-01 utc sh -c 'getent hosts build-01; getent hosts 127.0.1.1; "
+            "$T -q -H build-01 utc sh -c 'getent ahostsv4 build-01 | head -1; getent hosts 127.0.1.1; "
             "grep -c localhost /etc/hosts'"))
-        self.assertEqual(out[0].split(), ["127.0.1.1", "build-01"])
+        # IPv4 explicitly: for AAAA, nss-myhostname answers the current hostname with the
+        # link-local addresses of whatever interfaces are up, which varies by machine.
+        self.assertEqual(out[0].split(), ["127.0.1.1", "STREAM", "build-01"])
         self.assertEqual(out[1].split(), ["127.0.1.1", "build-01"])
         self.assertEqual(out[2], "1")  # original entries are kept
 
