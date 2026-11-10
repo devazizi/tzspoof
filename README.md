@@ -144,7 +144,13 @@ With `-H`, tzspoof also:
 - puts `127.0.1.1 NAME` at the top of `/etc/hosts`, so forward and reverse lookups return the spoofed name;
 - moves `files` to the front of the `hosts:` line in `/etc/nsswitch.conf`. Otherwise modules such as `resolve` (systemd-resolved), which run outside the namespace, answer first with the real host's data.
 
-Limits: `hostnamectl` and other D-Bus clients still ask systemd-hostnamed, which is outside the namespace, and so do `systemd-resolved` lookups made directly over D-Bus. `/etc/hosts` keeps its original lines, so a line that names the real host is still readable. `/etc/machine-id`, IP addresses and reverse DNS still identify the real host. `-H` needs namespaces: it cannot be combined with `-e`, and tzspoof exits with an error instead of falling back if namespace setup fails.
+Hiding the real name. tzspoof collects every name the host goes by (the current hostname, `/etc/hostname`, and what systemd-hostnamed reports, which inside nested sessions is the true host name) and replaces it, as a whole word and case-insensitively, with the spoofed name:
+- in `/etc/hosts` (so the real name no longer resolves), `/etc/printcap`, `/etc/mailname` and `/etc/machine-info`;
+- in every string coming back from the real system bus through the session's bus proxy: `hostnamectl`, `busctl ... hostname1`, `nmcli general hostname`, and any other service that reports it. All other values (kernel, OS, hardware, bus IDs) pass through unchanged.
+
+`--hide-logs` masks `/var/log` and `/run/log`: the journal, syslog and Xorg logs carry the real hostname in every entry and binary journals cannot be rewritten. It is opt-in because `journalctl` then shows nothing.
+
+Still not covered: files in `$XDG_RUNTIME_DIR` written by your desktop session (KDE/systemd unit metadata), and anything on the network (mDNS/Avahi announcements, DHCP hostname, reverse DNS of your IP). With `--no-bus`, D-Bus clients see the real name again. `-H` needs namespaces: it cannot be combined with `-e`, and tzspoof exits with an error instead of falling back if namespace setup fails.
 
 ### 4. Check Current Timezone Status
 
@@ -319,6 +325,7 @@ Options may appear before or right after `<TIMEZONE>` (`tzspoof -s tokyo -H box`
 | `-e` | `--env-only` | Skip Linux namespaces; only use `$TZ` and preload hook |
 | `-p` | `--preload` | Force loading of `libtzspoof.so` preload hook |
 | | `--no-bus` | Do not fake `org.freedesktop.timedate1`; `timedatectl` then reports the host's real zone |
+| | `--hide-logs` | Mask `/var/log` and `/run/log` (logs carry the real hostname in every entry) |
 | `-H` | `--hostname NAME` | Also spoof the hostname (UTS namespace, `/etc/hostname`, `/etc/hosts`) |
 | `-v` | `--version` | Display version information |
 | `-h` | `--help` | Display help menu |

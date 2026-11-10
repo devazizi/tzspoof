@@ -67,6 +67,9 @@ static void print_help(const char *progname) {
     printf("      %s--no-bus%s            Do not fake org.freedesktop.timedate1 (timedatectl) on the\n"
            "                         system bus; it then reports the host's real zone\n",
            CLR_GREEN, CLR_RESET);
+    printf("      %s--hide-logs%s         Mask /var/log and /run/log (journal and logs carry the\n"
+           "                         real hostname in every entry)\n",
+           CLR_GREEN, CLR_RESET);
     printf("  %s-H, --hostname NAME%s     Also spoof the hostname (UTS namespace, /etc/hostname,\n"
            "                         /etc/hosts); not available with --env-only\n",
            CLR_GREEN, CLR_RESET);
@@ -130,6 +133,7 @@ static const struct option long_options[] = {
     {"preload",    no_argument,       0, 'p'},
     {"hostname",   required_argument, 0, 'H'},
     {"no-bus",     no_argument,       0, 'B'},
+    {"hide-logs",  no_argument,       0, 'L'},
     {0, 0, 0, 0}
 };
 
@@ -174,6 +178,9 @@ static int parse_options(int argc, char *argv[], const char *progname, tz_config
                 break;
             case 'B':
                 config->no_bus = true;
+                break;
+            case 'L':
+                config->hide_logs = true;
                 break;
             case 'H':
                 if (!valid_hostname(optarg)) {
@@ -254,7 +261,8 @@ int main(int argc, char *argv[]) {
     /* Setup namespaces if not env-only */
     bool userns_active = false;
     if (!config.env_only) {
-        if (spoof_setup_namespaces(info.canonical, info.full_path, hostname, !config.no_bus, config.quiet)) {
+        if (spoof_setup_namespaces(info.canonical, info.full_path, hostname, !config.no_bus, config.hide_logs,
+                                   config.quiet)) {
             userns_active = true;
         } else if (hostname) {
             /* No environment-only fallback can change the hostname: fail loudly. */

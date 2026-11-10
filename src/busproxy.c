@@ -2,6 +2,7 @@
 #define _GNU_SOURCE
 #endif
 #include "busproxy.h"
+#include "scrub.h"
 #include "tzutil.h"
 #include <fcntl.h>
 #include <poll.h>
@@ -14,8 +15,12 @@
 /*
  * Scope and limits (deliberate):
  * - Only org.freedesktop.timedate1 is answered locally; everything else is
- *   relayed byte-for-byte, including SCM_RIGHTS fds, so systemctl, nmcli,
- *   logind inhibitors etc. keep working.
+ *   relayed, including SCM_RIGHTS fds, so systemctl, nmcli, logind
+ *   inhibitors etc. keep working.
+ * - With --hostname, every string in messages from the real bus is checked
+ *   for the real hostname(s) (hostnamed, NetworkManager, unit metadata...)
+ *   and the message body is re-encoded with the spoofed name. Only
+ *   little-endian bodies are rewritten (all x86/ARM peers use that).
  * - Writes are blocking. D-Bus peers always drain their sockets, and the
  *   traffic is small; a non-blocking write queue would only matter for a
  *   peer that stops reading, which would stall that one session's bus.
@@ -105,7 +110,7 @@ static void fdq_drop(fdq_t *q, int n) {
 typedef struct {
     bool le;
     uint8_t type, flags;
-    uint32_t serial, unix_fds;
+    uint32_t serial, unix_fds, reply_serial;
     const char *path, *iface, *member, *dest, *sig;
     size_t body_off, body_len, total;
 } hdr_t;
@@ -192,6 +197,7 @@ static bool parse_header(const uint8_t *m, size_t total, hdr_t *h) {
             case 3: h->member = s; break;
             case 6: h->dest = s; break;
             case 8: h->sig = s; break;
+            case 5: h->reply_serial = u; break;
             case 9: h->unix_fds = u; break;
             default: break;
         }
@@ -288,6 +294,166 @@ static void msg_begin(msg_t *m, uint8_t type, uint32_t reply_serial, const char 
 }
 
 static void msg_end(msg_t *m) { patch_u32(&m->b, 4, (uint32_t)(m->b.len - m->body_start)); }
+
+static void msg_call(msg_t *m, const char *dest, const char *path, const char *iface,
+                     const char *member, const char *sig) {
+    memset(m, 0, sizeof(*m));
+    buf_t *b = &m->b;
+    uint8_t fixed[4] = {'l', MSG_CALL, 0, 1};
+    buf_put(b, fixed, 4);
+    put_u32(b, 0);
+    put_u32(b, g_serial++);
+    put_u32(b, 0);
+    size_t start = b->len;
+    put_field(b, 1, 'o', path, 0);
+    put_field(b, 2, 's', iface, 0);
+    put_field(b, 3, 's', member, 0);
+    put_field(b, 6, 's', dest, 0);
+    if (sig && *sig) put_field(b, 8, 'g', sig, 0);
+    patch_u32(b, 12, (uint32_t)(b->len - start));
+    put_pad(b, 8);
+    m->body_start = b->len;
+}
+
+/* --------------------------------------------- hostname scrubbing (bodies) */
+
+/* Length of one complete type at sig, 0 if invalid. */
+static size_t sig_type_len(const char *sig) {
+    switch (*sig) {
+        case 'a': {
+            size_t l = sig_type_len(sig + 1);
+            return l ? l + 1 : 0;
+        }
+        case '(':
+        case '{': {
+            char close = *sig == '(' ? ')' : '}';
+            size_t i = 1;
+            while (sig[i] && sig[i] != close) {
+                size_t l = sig_type_len(sig + i);
+                if (!l) return 0;
+                i += l;
+            }
+            return sig[i] == close ? i + 1 : 0;
+        }
+        case '\0':
+            return 0;
+        default:
+            return strchr("ybnqiuxtdhsogv", *sig) ? 1 : 0;
+    }
+}
+
+static size_t type_align(char c) {
+    switch (c) {
+        case 'y': case 'g': case 'v': return 1;
+        case 'n': case 'q': return 2;
+        case 'x': case 't': case 'd': case '(': case '{': return 8;
+        default: return 4; /* b i u h s o a */
+    }
+}
+
+typedef struct {
+    const uint8_t *m;
+    size_t off, end;
+} reader_t;
+
+static bool copy_raw(reader_t *r, buf_t *o, size_t n) {
+    if (r->off + n > r->end) return false;
+    buf_put(o, r->m + r->off, n);
+    r->off += n;
+    return true;
+}
+
+/* Copy one value of type sig (one complete type) from r to o, rewriting
+ * strings that contain a real hostname. Offsets are absolute in the
+ * message on both sides, so alignment is preserved. */
+static bool copy_value(reader_t *r, const char *sig, buf_t *o, int depth) {
+    if (depth > 64) return false;
+    char c = sig[0];
+    size_t a = type_align(c);
+    r->off = align_up(r->off, a);
+    put_pad(o, a);
+    switch (c) {
+        case 'y': return copy_raw(r, o, 1);
+        case 'n': case 'q': return copy_raw(r, o, 2);
+        case 'b': case 'i': case 'u': case 'h': return copy_raw(r, o, 4);
+        case 'x': case 't': case 'd': return copy_raw(r, o, 8);
+        case 's': case 'o': {
+            if (r->off + 4 > r->end) return false;
+            uint32_t len = rd32(r->m + r->off, true);
+            if ((uint64_t)r->off + 4 + len + 1 > r->end) return false;
+            const char *str = (const char *)r->m + r->off + 4;
+            size_t new_len = 0;
+            char *rep = c == 's' ? scrub_text(str, len, &new_len) : NULL;
+            if (!rep) return copy_raw(r, o, 4 + (size_t)len + 1);
+            put_u32(o, (uint32_t)new_len);
+            buf_put(o, rep, new_len + 1);
+            free(rep);
+            r->off += 4 + (size_t)len + 1;
+            return true;
+        }
+        case 'g': {
+            if (r->off >= r->end) return false;
+            return copy_raw(r, o, 1 + (size_t)r->m[r->off] + 1);
+        }
+        case 'v': {
+            if (r->off >= r->end) return false;
+            size_t sig_at = r->off + 1;
+            if (!copy_raw(r, o, 1 + (size_t)r->m[r->off] + 1)) return false;
+            const char *inner = (const char *)r->m + sig_at;
+            if (sig_type_len(inner) != strlen(inner)) return false;
+            return copy_value(r, inner, o, depth + 1);
+        }
+        case 'a': {
+            if (r->off + 4 > r->end) return false;
+            uint32_t len = rd32(r->m + r->off, true);
+            r->off += 4;
+            put_u32(o, 0);
+            size_t len_at = o->len - 4;
+            size_t ea = type_align(sig[1]);
+            r->off = align_up(r->off, ea);
+            put_pad(o, ea);
+            size_t in_end = r->off + len, out_start = o->len;
+            if (in_end > r->end) return false;
+            while (r->off < in_end) {
+                if (!copy_value(r, sig + 1, o, depth + 1)) return false;
+            }
+            if (r->off != in_end) return false;
+            patch_u32(o, len_at, (uint32_t)(o->len - out_start));
+            return true;
+        }
+        case '(': case '{': {
+            const char *f = sig + 1;
+            while (*f != ')' && *f != '}') {
+                if (!copy_value(r, f, o, depth + 1)) return false;
+                f += sig_type_len(f);
+            }
+            return true;
+        }
+        default:
+            return false;
+    }
+}
+
+/* Re-encode msg with real hostnames replaced. Returns a malloc'd buffer
+ * (its length in *out_len) or NULL to forward the original unchanged. */
+static uint8_t *scrub_message(const uint8_t *msg, const hdr_t *h, size_t *out_len) {
+    if (!h->le || !h->sig || !*h->sig || scrub_count() == 0 ||
+        !scrub_contains(msg + h->body_off, h->body_len)) {
+        return NULL;
+    }
+    buf_t o = {0};
+    buf_put(&o, msg, h->body_off); /* header unchanged; only its body length is patched */
+    reader_t r = {.m = msg, .off = h->body_off, .end = h->body_off + h->body_len};
+    for (const char *t = h->sig; *t; t += sig_type_len(t)) {
+        if (!sig_type_len(t) || !copy_value(&r, t, &o, 0)) {
+            buf_free(&o);
+            return NULL; /* unexpected encoding: forward as-is rather than break it */
+        }
+    }
+    patch_u32(&o, 4, (uint32_t)(o.len - h->body_off));
+    *out_len = o.len;
+    return o.d;
+}
 
 /* ------------------------------------------------------- timedate1 model */
 
@@ -579,8 +745,13 @@ static bool upstream_messages(conn_t *c) {
         if (parsed && h.dest && h.dest[0] == ':' && !c->unique[0]) {
             snprintf(c->unique, sizeof(c->unique), "%s", h.dest);
         }
+        uint8_t *scrubbed = NULL;
+        size_t scrubbed_len = 0;
         if (parsed && h.type == MSG_SIGNAL && streq(h.path, TD_PATH)) {
             fdq_drop(&c->uq, (int)h.unix_fds); /* real timedated's PropertiesChanged */
+        } else if (parsed && (scrubbed = scrub_message(c->uin.d, &h, &scrubbed_len))) {
+            ok = forward(c->cfd, scrubbed, scrubbed_len, &c->uq, h.unix_fds);
+            free(scrubbed);
         } else {
             ok = forward(c->cfd, c->uin.d, (size_t)total, &c->uq, parsed ? h.unix_fds : 0);
         }
@@ -787,4 +958,88 @@ void busproxy_start(const char *tz_canonical) {
     }
     /* Parent (and failed fork): the command never needs these fds. */
     busproxy_cancel();
+}
+
+/* Read whole messages from fd into b until one replies to `serial`. */
+static bool wait_reply(int fd, buf_t *b, uint32_t serial, hdr_t *h, long *total) {
+    for (;;) {
+        long t;
+        while ((t = msg_length(b->d, b->len)) > 0) {
+            if (parse_header(b->d, (size_t)t, h) && h->reply_serial == serial &&
+                (h->type == MSG_RETURN || h->type == MSG_ERROR)) {
+                *total = t;
+                return true;
+            }
+            buf_consume(b, (size_t)t);
+        }
+        if (t < 0) return false;
+        struct pollfd p = {.fd = fd, .events = POLLIN};
+        if (poll(&p, 1, 2000) <= 0) return false;
+        uint8_t data[16384];
+        ssize_t n = read(fd, data, sizeof(data));
+        if (n <= 0 || !buf_put(b, data, (size_t)n)) return false;
+    }
+}
+
+int busproxy_query_hostnames(void (*add)(const char *name)) {
+    int fd = socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0);
+    struct sockaddr_un sa = {.sun_family = AF_UNIX};
+    snprintf(sa.sun_path, sizeof(sa.sun_path), "%s", SYSTEM_BUS_SOCKET);
+    if (fd < 0 || connect(fd, (struct sockaddr *)&sa, sizeof(sa)) != 0) {
+        if (fd >= 0) close(fd);
+        return 0;
+    }
+    char uid[16], auth[64] = "";
+    snprintf(uid, sizeof(uid), "%u", (unsigned)getuid());
+    size_t al = (size_t)snprintf(auth, sizeof(auth), "%cAUTH EXTERNAL ", '\0');
+    for (const char *p = uid; *p; p++) al += (size_t)snprintf(auth + al, sizeof(auth) - al, "%02x", *p);
+    al += (size_t)snprintf(auth + al, sizeof(auth) - al, "\r\n");
+
+    int found = 0;
+    buf_t in = {0};
+    char line[256];
+    ssize_t n;
+    struct pollfd p = {.fd = fd, .events = POLLIN};
+    if (!send_all(fd, (const uint8_t *)auth, al, NULL, 0) || poll(&p, 1, 2000) <= 0 ||
+        (n = read(fd, line, sizeof(line) - 1)) <= 2 || strncmp(line, "OK ", 3) != 0 ||
+        !send_all(fd, (const uint8_t *)"BEGIN\r\n", 7, NULL, 0)) {
+        close(fd);
+        return 0;
+    }
+
+    msg_t m;
+    msg_call(&m, BUS_NAME, "/org/freedesktop/DBus", BUS_NAME, "Hello", NULL);
+    msg_end(&m);
+    uint32_t hello = rd32(m.b.d + 8, true);
+    bool ok = send_all(fd, m.b.d, m.b.len, NULL, 0);
+    buf_free(&m.b);
+    hdr_t h;
+    long total;
+    ok = ok && wait_reply(fd, &in, hello, &h, &total);
+    if (ok) buf_consume(&in, (size_t)total);
+
+    static const char *const props[] = {"StaticHostname", "Hostname", "PrettyHostname"};
+    for (size_t i = 0; ok && i < sizeof(props) / sizeof(props[0]); i++) {
+        msg_call(&m, "org.freedesktop.hostname1", "/org/freedesktop/hostname1", PROPS_IFACE, "Get", "ss");
+        put_str(&m.b, "org.freedesktop.hostname1");
+        put_str(&m.b, props[i]);
+        msg_end(&m);
+        uint32_t serial = rd32(m.b.d + 8, true);
+        ok = send_all(fd, m.b.d, m.b.len, NULL, 0) && wait_reply(fd, &in, serial, &h, &total);
+        buf_free(&m.b);
+        if (!ok) break;
+        if (h.type == MSG_RETURN && h.le && streq(h.sig, "v")) {
+            size_t off = h.body_off, end = h.body_off + h.body_len;
+            const char *vs = rd_sig(in.d, end, &off);
+            const char *val = streq(vs, "s") ? rd_str(in.d, end, &off, true) : NULL;
+            if (val && *val) {
+                add(val);
+                found++;
+            }
+        }
+        buf_consume(&in, (size_t)total);
+    }
+    buf_free(&in);
+    close(fd);
+    return found;
 }

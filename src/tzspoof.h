@@ -52,6 +52,7 @@ typedef struct {
     char target_zone[128];
     char hostname[TZS_HOST_NAME_MAX + 1]; /* empty: keep the real hostname */
     bool no_bus;                          /* do not fake org.freedesktop.timedate1 */
+    bool hide_logs;                       /* mask /var/log and /run/log (hostname in every entry) */
     bool interactive_shell;
     bool quiet;
     bool env_only;

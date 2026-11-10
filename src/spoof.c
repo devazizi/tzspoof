@@ -4,6 +4,7 @@
 #include "spoof.h"
 #include "tzutil.h"
 #include "busproxy.h"
+#include "scrub.h"
 #include <sched.h>
 #include <sys/mount.h>
 #include <fcntl.h>
@@ -103,12 +104,55 @@ static bool write_scratch(int dir, const char *name, const char *content) {
 static bool write_hosts(int dir, const char *hostname) {
     char *orig = read_small_file(HOSTS_FILE);
     if (!orig) return false;
+    /* Existing lines naming the real host ("127.0.1.1 alipc") now name the spoofed one. */
+    char *scrubbed = scrub_text(orig, strlen(orig), NULL);
     char *out = NULL;
-    bool ok = asprintf(&out, "# tzspoof: spoofed hostname\n127.0.1.1\t%s\n%s", hostname, orig) >= 0 &&
+    bool ok = asprintf(&out, "# tzspoof: spoofed hostname\n127.0.1.1\t%s\n%s", hostname,
+                       scrubbed ? scrubbed : orig) >= 0 &&
               write_scratch(dir, "hosts", out);
     free(out);
+    free(scrubbed);
     free(orig);
     return ok;
+}
+
+/*
+ * Other /etc files that commonly carry the hostname. Each is replaced only
+ * if it exists and actually names a real host.
+ */
+static const struct {
+    const char *path, *scratch_name;
+} NAMED_FILES[] = {
+    {"/etc/printcap", "printcap"},         /* written by CUPS */
+    {"/etc/mailname", "mailname"},         /* Debian MTA identity */
+    {"/etc/machine-info", "machine-info"}, /* PRETTY_HOSTNAME */
+    {NULL, NULL},
+};
+
+static bool write_scrubbed(int dir, const char *name, const char *src) {
+    char *orig = read_small_file(src);
+    if (!orig) return false;
+    char *scrubbed = scrub_text(orig, strlen(orig), NULL);
+    bool ok = scrubbed && write_scratch(dir, name, scrubbed);
+    free(scrubbed);
+    free(orig);
+    return ok;
+}
+
+/* Record every name the real host goes by, before the UTS namespace changes. */
+static void collect_real_hostnames(const char *spoof) {
+    scrub_set_spoof(spoof);
+    char name[256] = {0};
+    if (gethostname(name, sizeof(name) - 1) == 0) scrub_add_name(name);
+    char *etc = read_small_file(HOSTNAME_FILE);
+    if (etc) {
+        etc[strcspn(etc, "\n")] = '\0';
+        scrub_add_name(etc);
+        free(etc);
+    }
+    /* Inside a nested session the two above show the outer spoof;
+     * systemd-hostnamed still knows the true host name. */
+    busproxy_query_hostnames(scrub_add_name);
 }
 
 /*
@@ -179,6 +223,9 @@ static int make_scratch_tmpfs(const char *tz_canonical, const char *tz_path, con
         /* Missing source files only mean there is nothing to replace. */
         if (!write_hosts(mnt, hostname) && errno != ENOENT) goto fail;
         if (!write_nsswitch(mnt) && errno != ENOENT) goto fail;
+        for (int i = 0; NAMED_FILES[i].path; i++) {
+            write_scrubbed(mnt, NAMED_FILES[i].scratch_name, NAMED_FILES[i].path);
+        }
     }
     return mnt;
 
@@ -240,9 +287,11 @@ static bool write_clock_config(int dir, const char *name, const char *src, const
 }
 
 bool spoof_setup_namespaces(const char *tz_canonical, const char *tz_path, const char *hostname,
-                            bool fake_bus, bool quiet) {
+                            bool fake_bus, bool hide_logs, bool quiet) {
     uid_t uid = getuid();
     gid_t gid = getgid();
+
+    if (hostname) collect_real_hostnames(hostname);
 
     /* Unshare user and mount namespaces (plus UTS when spoofing the hostname) */
     int flags = CLONE_NEWUSER | CLONE_NEWNS | (hostname ? CLONE_NEWUTS : 0);
@@ -313,6 +362,23 @@ bool spoof_setup_namespaces(const char *tz_canonical, const char *tz_path, const
     if (write_clock_config(scratch, "confd-clock", CONFD_CLOCK, tz_canonical)) {
         replace_optional(scratch, "confd-clock", CONFD_CLOCK, quiet);
     }
+    /*
+     * Logs stamp the real hostname into every entry (journal _HOSTNAME,
+     * syslog, Xorg). Binary journals cannot be rewritten, so --hide-logs
+     * masks them; it is opt-in because journalctl then shows nothing.
+     */
+    if (hide_logs) {
+        const char *log_dirs[] = {"/var/log", "/run/log", NULL};
+        for (int i = 0; log_dirs[i]; i++) {
+            struct stat ls;
+            if (stat(log_dirs[i], &ls) == 0 && S_ISDIR(ls.st_mode) &&
+                mount("tmpfs", log_dirs[i], "tmpfs", MS_NOSUID | MS_NODEV, "mode=0755") != 0 && !quiet) {
+                fprintf(stderr, "%s[!] Warning: could not hide %s (%s).%s\n",
+                        CLR_YELLOW, log_dirs[i], strerror(errno), CLR_RESET);
+            }
+        }
+    }
+
     /* timedatectl & co. ask systemd-timedated over the system bus. */
     if (fake_bus && busproxy_prepare(scratch) &&
         !replace_optional(scratch, BUSPROXY_SOCKET_NAME, SYSTEM_BUS_SOCKET, quiet)) {
@@ -322,6 +388,9 @@ bool spoof_setup_namespaces(const char *tz_canonical, const char *tz_path, const
         replace_optional(scratch, "hostname", HOSTNAME_FILE, quiet);
         replace_optional(scratch, "hosts", HOSTS_FILE, quiet);
         replace_optional(scratch, "nsswitch.conf", NSSWITCH_FILE, quiet);
+        for (int i = 0; NAMED_FILES[i].path; i++) {
+            replace_optional(scratch, NAMED_FILES[i].scratch_name, NAMED_FILES[i].path, quiet);
+        }
     }
 
     close(scratch);

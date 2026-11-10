@@ -32,6 +32,13 @@ void busproxy_cancel(void);
  */
 void busproxy_start(const char *tz_canonical);
 
+/*
+ * Ask systemd-hostnamed (via the real system bus) for StaticHostname,
+ * Hostname and PrettyHostname, passing each non-empty value to add().
+ * Returns how many were found; 0 if there is no bus or hostnamed.
+ */
+int busproxy_query_hostnames(void (*add)(const char *name));
+
 /* Run the proxy loop in the current process (used by busproxy_start). */
 void busproxy_serve(int listen_fd, int upstream_path_fd, const char *tz_canonical);
 

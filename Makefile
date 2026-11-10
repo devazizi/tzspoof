@@ -12,7 +12,7 @@ BIN = bin
 TARGET = $(BIN)/tzspoof
 PRELOAD_LIB = $(BIN)/libtzspoof.so
 
-SOURCES = $(SRCDIR)/main.c $(SRCDIR)/spoof.c $(SRCDIR)/tzutil.c $(SRCDIR)/busproxy.c
+SOURCES = $(SRCDIR)/main.c $(SRCDIR)/spoof.c $(SRCDIR)/tzutil.c $(SRCDIR)/busproxy.c $(SRCDIR)/scrub.c
 OBJECTS = $(SOURCES:$(SRCDIR)/%.c=$(OBJDIR)/%.o)
 
 .PHONY: all clean test install uninstall help
