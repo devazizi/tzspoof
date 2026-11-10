@@ -294,6 +294,50 @@ static int list_nftw_cb(const char *fpath, const struct stat *sb, int typeflag, 
     return 0;
 }
 
+static char **s_collect = NULL;
+static size_t s_collect_n = 0, s_collect_cap = 0;
+
+static int collect_nftw_cb(const char *fpath, const struct stat *sb, int typeflag, struct FTW *ftwbuf) {
+    (void)sb;
+    (void)ftwbuf;
+    if (typeflag != FTW_F && typeflag != FTW_SL) return 0;
+    const char *rel = fpath + strlen(ZONEINFO_DIR) + 1;
+    if (strncmp(rel, "posix/", 6) == 0 || strncmp(rel, "right/", 6) == 0 ||
+        strncmp(rel, "SystemV/", 8) == 0 || strchr(rel, '.') != NULL ||
+        strcmp(rel, "localtime") == 0 || strcmp(rel, "posixrules") == 0 || !is_valid_tzfile(fpath)) {
+        return 0;
+    }
+    if (s_collect_n == s_collect_cap) {
+        size_t cap = s_collect_cap ? s_collect_cap * 2 : 512;
+        char **grown = realloc(s_collect, cap * sizeof(char *));
+        if (!grown) return 1;
+        s_collect = grown;
+        s_collect_cap = cap;
+    }
+    char *dup = strdup(rel);
+    if (!dup) return 1;
+    s_collect[s_collect_n++] = dup;
+    return 0;
+}
+
+static int cmp_str(const void *a, const void *b) {
+    return strcmp(*(char *const *)a, *(char *const *)b);
+}
+
+size_t tz_collect(char ***out) {
+    s_collect = NULL;
+    s_collect_n = s_collect_cap = 0;
+    nftw(ZONEINFO_DIR, collect_nftw_cb, 20, FTW_PHYS);
+    if (s_collect_n) qsort(s_collect, s_collect_n, sizeof(char *), cmp_str);
+    *out = s_collect;
+    return s_collect_n;
+}
+
+void tz_collect_free(char **zones, size_t n) {
+    for (size_t i = 0; i < n; i++) free(zones[i]);
+    free(zones);
+}
+
 void tz_list(const char *filter) {
     s_list_filter = filter;
     s_list_total = 0;

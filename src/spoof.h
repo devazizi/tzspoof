@@ -5,7 +5,7 @@
 
 /* Set up private user and mount namespaces, bind mount /etc/localtime and /etc/timezone */
 bool spoof_setup_namespaces(const char *tz_canonical, const char *tz_path, const char *hostname,
-                            bool quiet);
+                            bool fake_bus, bool quiet);
 
 /* Configure environment variables ($TZ, $TZSPOOF_*, LD_PRELOAD) */
 bool spoof_setup_environment(const char *tz_canonical, const char *tz_path, const char *hostname,

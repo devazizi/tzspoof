@@ -55,9 +55,19 @@ def _inner(mountpoint: str, localtime_kind: str, cmd: str) -> None:
     real_etc.mkdir()
     fake_etc.mkdir()
     _mount(b"/etc", str(real_etc).encode(), None, MS_BIND | MS_REC)
+    clock_dirs = {"sysconfig": ("clock", 'ZONE="Europe/Paris"\nUTC=true\n'),
+                  "conf.d": ("clock", 'TIMEZONE="Europe/Paris"\nCLOCK="UTC"\n')}
     for entry in os.listdir(real_etc):
-        if entry not in ("localtime", "timezone", "hostname", "hosts", "nsswitch.conf"):
+        if entry not in ("localtime", "timezone", "hostname", "hosts", "nsswitch.conf", *clock_dirs):
             (fake_etc / entry).symlink_to(real_etc / entry)
+    # Distribution clock configs (RHEL /etc/sysconfig/clock, OpenRC /etc/conf.d/clock).
+    for d, (name, content) in clock_dirs.items():
+        (fake_etc / d).mkdir()
+        if (real_etc / d).is_dir():
+            for child in os.listdir(real_etc / d):
+                if child != name:
+                    (fake_etc / d / child).symlink_to(real_etc / d / child)
+        (fake_etc / d / name).write_text(content)
 
     zone_file = ZONEINFO / HOST_ZONE
     if localtime_kind == "symlink":
@@ -223,6 +233,114 @@ class PreloadAbiTest(unittest.TestCase):
                           for m in [re.search(r"GLIBC_(\d+)\.(\d+)", line)]
                           if m and (int(m.group(1)), int(m.group(2))) > self.MAX_GLIBC})
         self.assertEqual(too_new, [], "symbols need a newer glibc than bundled runtimes may have")
+
+
+def _host(cmd: str) -> subprocess.CompletedProcess:
+    return subprocess.run(["sh", "-c", cmd], capture_output=True, text=True, timeout=30)
+
+
+def _has_timedated() -> bool:
+    import shutil
+    if not shutil.which("busctl") or not Path("/run/dbus/system_bus_socket").is_socket():
+        return False
+    return _host("busctl --system get-property org.freedesktop.timedate1 "
+                 "/org/freedesktop/timedate1 org.freedesktop.timedate1 Timezone").returncode == 0
+
+
+TD = "org.freedesktop.timedate1 /org/freedesktop/timedate1 org.freedesktop.timedate1"
+
+
+@unittest.skipUnless(TZSPOOF.exists() and _has_timedated(), "needs 'make', busctl and a system bus with timedated")
+class TimeServicesTest(unittest.TestCase):
+    """org.freedesktop.timedate1 (timedatectl) is answered by the session's bus proxy."""
+
+    def test_all_dbus_client_libraries_see_spoofed_zone(self):
+        import shutil
+        probes = [f"timedatectl show -p Timezone --value", f"busctl --system get-property {TD} Timezone"]
+        if shutil.which("dbus-send"):  # libdbus
+            probes.append("dbus-send --system --print-reply=literal --dest=org.freedesktop.timedate1 "
+                          "/org/freedesktop/timedate1 org.freedesktop.DBus.Properties.Get "
+                          "string:org.freedesktop.timedate1 string:Timezone; echo")  # literal mode prints no newline
+        if shutil.which("gdbus"):  # GDBus (GNOME/GTK apps)
+            probes.append("gdbus call --system --dest org.freedesktop.timedate1 --object-path "
+                          "/org/freedesktop/timedate1 --method org.freedesktop.DBus.Properties.Get "
+                          "org.freedesktop.timedate1 Timezone")
+        out = lines(sandbox("$T -q tokyo sh -c '" + "; ".join(probes) + "'"))
+        self.assertEqual(len(out), len(probes))
+        for probe, line in zip(probes, out):
+            self.assertIn("Asia/Tokyo", line, probe)
+
+    def test_timedatectl_status(self):
+        out = "\n".join(lines(sandbox("$T -q tokyo timedatectl status")))
+        self.assertRegex(out, r"Local time: .* JST")
+        self.assertIn("Time zone: Asia/Tokyo (JST, +0900)", out)
+
+    def test_changes_are_denied_and_host_untouched(self):
+        before = _host(f"busctl --system get-property {TD} Timezone").stdout
+        res = sandbox("$T -q tokyo timedatectl set-timezone UTC")
+        self.assertNotEqual(res.returncode, 0)
+        self.assertIn("Access denied", res.stderr)
+        self.assertEqual(_host(f"busctl --system get-property {TD} Timezone").stdout, before)
+
+    def test_other_services_are_forwarded(self):
+        hn = "org.freedesktop.hostname1 /org/freedesktop/hostname1 org.freedesktop.hostname1 Hostname"
+        bus_id = "org.freedesktop.DBus /org/freedesktop/DBus org.freedesktop.DBus GetId"
+        want = [_host(f"busctl --system get-property {hn}").stdout.strip(),
+                _host(f"busctl --system call {bus_id}").stdout.strip()]
+        out = lines(sandbox(f"$T -q tokyo sh -c 'busctl --system get-property {hn}; busctl --system call {bus_id}'"))
+        self.assertEqual(out, want)
+
+    def test_fd_passing_is_forwarded(self):
+        cmd = "systemd-inhibit --what=idle --who=tzspoof-test --why=test true"
+        if _host(cmd).returncode != 0:
+            self.skipTest("systemd-inhibit not permitted on this host")
+        self.assertEqual(sandbox(f"$T -q tokyo {cmd}").returncode, 0)
+
+    def test_nested_sessions(self):
+        out = lines(sandbox("$T -q tokyo $T -q london timedatectl show -p Timezone --value"))
+        self.assertEqual(out, ["Europe/London"])
+
+    def test_no_bus_flag(self):
+        real = _host("timedatectl show -p Timezone --value").stdout.strip()
+        self.assertEqual(lines(sandbox("$T -q --no-bus tokyo timedatectl show -p Timezone --value")), [real])
+
+    def test_proxy_exits_with_command(self):
+        marker = "0.2345"
+        lines(sandbox(f"$T -q tokyo sleep {marker}"))
+        leftover = _host(f"pgrep -f 'tzspoof -q tokyo sleep {marker}'")
+        self.assertEqual(leftover.stdout.strip(), "", "bus proxy outlived its session")
+
+
+@unittest.skipUnless(TZSPOOF.exists(), "run 'make' first")
+class TimeConfigTest(unittest.TestCase):
+    """Other places that expose the zone or UTC offset."""
+
+    def test_distribution_clock_configs(self):
+        out = lines(sandbox("$T -q tokyo cat /etc/sysconfig/clock /etc/conf.d/clock"))
+        self.assertEqual(out, ['ZONE="Asia/Tokyo"', "UTC=true", 'TIMEZONE="Asia/Tokyo"', 'CLOCK="UTC"'])
+
+    def test_kernel_timezone_from_gettimeofday(self):
+        import shutil
+        cc = shutil.which("cc") or shutil.which("gcc")
+        if not cc:
+            self.skipTest("no C compiler")
+        probe = ("import ctypes\n"
+                 "class TZ(ctypes.Structure): _fields_=[('w',ctypes.c_int),('d',ctypes.c_int)]\n"
+                 "tv=(ctypes.c_long*2)(); tz=TZ(); ctypes.CDLL(None).gettimeofday(tv, ctypes.byref(tz))\n"
+                 "print(tz.w)\n")
+        # Stand-in for a host whose RTC keeps local time (kernel sys_tz = Tehran, -210).
+        fake_src = ("struct tz { int w, d; };\n"
+                    "int gettimeofday(void *tv, struct tz *tz) { (void)tv; if (tz) { tz->w = -210; tz->d = 0; } return 0; }\n")
+        with tempfile.TemporaryDirectory() as d:
+            (Path(d) / "probe.py").write_text(probe)
+            (Path(d) / "fake.c").write_text(fake_src)
+            subprocess.run([cc, "-shared", "-fPIC", "-o", f"{d}/fake.so", f"{d}/fake.c"], check=True)
+            out = lines(sandbox(
+                f"$T -q tokyo sh -c '{sys.executable} -I {d}/probe.py; "
+                f"LD_PRELOAD=\"$LD_PRELOAD:{d}/fake.so\" {sys.executable} -I {d}/probe.py'; "
+                f"LD_PRELOAD={d}/fake.so {sys.executable} -I {d}/probe.py"))
+        # UTC-RTC host: 0 stays 0; local-RTC host: spoofed offset (Tokyo = -540); outside: untouched.
+        self.assertEqual(out, ["0", "-540", "-210"])
 
 
 @unittest.skipUnless(TZSPOOF.exists(), "run 'make' first")

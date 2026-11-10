@@ -13,6 +13,8 @@ A lightweight, zero-dependency, high-fidelity **Timezone Spoofing Utility** for 
 - **Works with Static & Dynamic Binaries**: Because changes happen at the Linux Virtual File System (VFS) layer, statically linked binaries (Go, Rust), dynamic libraries (glibc/musl), and interpreted runtimes (Python, Node.js, Ruby) all see the spoofed timezone identically.
 - **Companion Preload Hook (`libtzspoof.so`)**: Intercepts `readlink`, `__readlink_chk`, and `readlinkat` on `/etc/localtime`, ensuring utilities that inspect the symlink target directly (such as `readlink /etc/localtime`) report the exact target timezone path.
 - **Smart Aliases & Fuzzy Matching**: Supports popular shortcuts (e.g. `tokyo`, `london`, `ny`, `la`, `berlin`, `tehran`, `dubai`, `utc`), case-insensitive searches, and city suffix resolution.
+- **`timedatectl` and D-Bus clients see the spoofed zone**: `systemd-timedated` runs outside the session and would report the host's zone. tzspoof puts a filtering proxy on the session's `/run/dbus/system_bus_socket` that answers `org.freedesktop.timedate1` itself (`Timezone`, `LocalRTC`, `NTP`, `TimeUSec`, `ListTimezones`; changes are refused) and relays everything else to the real system bus, fd passing included, so `systemctl`, `nmcli` and logind keep working. Disable with `--no-bus`.
+- **Every other place the zone shows up**: `/etc/localtime` (symlink or file), `/etc/timezone`, `$TZ`, `ZONE=`/`TIMEZONE=` in `/etc/sysconfig/clock` and `/etc/conf.d/clock`, and the kernel timezone returned by `gettimeofday()` on hosts whose RTC keeps local time.
 - **Optional Hostname Spoofing (`-H NAME`)**: Adds a UTS namespace so `uname -n`, `hostname`, `gethostname()` and `/proc/sys/kernel/hostname` report `NAME` for static and dynamic binaries alike, and replaces `/etc/hostname` and `/etc/hosts` so the name resolves locally.
 - **Preserved User Identity**: Maps the user's real UID/GID inside the namespace, preserving file permissions, home directory access, and shell prompt settings.
 
@@ -117,6 +119,19 @@ tzspoof tokyo python3 -c "import datetime; print(datetime.datetime.now().astimez
 # Execute complex commands with -- delimiter:
 tzspoof london -- sh -c 'date; cat /etc/timezone; readlink /etc/localtime'
 ```
+
+### Where the timezone is visible, and what tzspoof does
+
+| Source | Readers | Inside tzspoof |
+|---|---|---|
+| `/etc/localtime` | glibc, musl, Go, Rust, Java, Node/ICU, Python | target zone (mount; a symlink stays a symlink) |
+| `$TZ` | glibc and most runtimes | target zone |
+| `/etc/timezone` | Debian tools, Java, tzlocal | target zone (if the file exists) |
+| `/etc/sysconfig/clock`, `/etc/conf.d/clock` | RHEL/SUSE, OpenRC, tzlocal | `ZONE=`/`TIMEZONE=` rewritten (if the file exists) |
+| `org.freedesktop.timedate1` (D-Bus) | `timedatectl`, desktop clocks, GDBus/sd-bus/libdbus apps | answered by the session's bus proxy |
+| kernel `sys_tz` via `gettimeofday(tv, tz)` | legacy programs | 0 stays 0 (UTC RTC); a non-zero value becomes the target offset |
+
+Not covered: on a host whose RTC keeps local time, `/sys/class/rtc/rtc0/time` and `/proc/driver/rtc` still show the host's local wall clock; the `gettimeofday()` fix only applies to dynamically linked programs; `-e` (environment-only) mode has no bus proxy.
 
 ### 3. Spoof the Hostname Too
 
@@ -303,6 +318,7 @@ Options may appear before or right after `<TIMEZONE>` (`tzspoof -s tokyo -H box`
 | `-q` | `--quiet` | Quiet mode (suppress banners and informational messages) |
 | `-e` | `--env-only` | Skip Linux namespaces; only use `$TZ` and preload hook |
 | `-p` | `--preload` | Force loading of `libtzspoof.so` preload hook |
+| | `--no-bus` | Do not fake `org.freedesktop.timedate1`; `timedatectl` then reports the host's real zone |
 | `-H` | `--hostname NAME` | Also spoof the hostname (UTS namespace, `/etc/hostname`, `/etc/hosts`) |
 | `-v` | `--version` | Display version information |
 | `-h` | `--help` | Display help menu |

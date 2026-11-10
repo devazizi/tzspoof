@@ -64,6 +64,9 @@ static void print_help(const char *progname) {
            CLR_GREEN, CLR_RESET);
     printf("  %s-p, --preload%s           Force loading of libtzspoof.so preload hook\n",
            CLR_GREEN, CLR_RESET);
+    printf("      %s--no-bus%s            Do not fake org.freedesktop.timedate1 (timedatectl) on the\n"
+           "                         system bus; it then reports the host's real zone\n",
+           CLR_GREEN, CLR_RESET);
     printf("  %s-H, --hostname NAME%s     Also spoof the hostname (UTS namespace, /etc/hostname,\n"
            "                         /etc/hosts); not available with --env-only\n",
            CLR_GREEN, CLR_RESET);
@@ -126,6 +129,7 @@ static const struct option long_options[] = {
     {"env-only",   no_argument,       0, 'e'},
     {"preload",    no_argument,       0, 'p'},
     {"hostname",   required_argument, 0, 'H'},
+    {"no-bus",     no_argument,       0, 'B'},
     {0, 0, 0, 0}
 };
 
@@ -167,6 +171,9 @@ static int parse_options(int argc, char *argv[], const char *progname, tz_config
                 break;
             case 'p':
                 config->force_preload = true;
+                break;
+            case 'B':
+                config->no_bus = true;
                 break;
             case 'H':
                 if (!valid_hostname(optarg)) {
@@ -247,7 +254,7 @@ int main(int argc, char *argv[]) {
     /* Setup namespaces if not env-only */
     bool userns_active = false;
     if (!config.env_only) {
-        if (spoof_setup_namespaces(info.canonical, info.full_path, hostname, config.quiet)) {
+        if (spoof_setup_namespaces(info.canonical, info.full_path, hostname, !config.no_bus, config.quiet)) {
             userns_active = true;
         } else if (hostname) {
             /* No environment-only fallback can change the hostname: fail loudly. */

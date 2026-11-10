@@ -16,6 +16,7 @@
 #include <stdarg.h>
 #include <sys/types.h>
 #include <sys/stat.h>
+#include <time.h>
 
 /* Forward declarations for legacy glibc stat functions if headers omit them */
 int __xstat(int ver, const char *path, struct stat *statbuf);
@@ -431,6 +432,36 @@ int __fxstatat64(int ver, int dirfd, const char *pathname, struct stat64 *buf, i
     }
     int res = real_fxstatat64 ? real_fxstatat64(ver, dirfd, pathname, buf, flags) : -1;
     if (res == 0) fix_stat64_buf(buf);
+    return res;
+}
+
+/*
+ * gettimeofday(tv, tz): the tz argument returns the kernel's sys_tz, which
+ * systemd sets to the host's UTC offset when the RTC keeps local time
+ * (/etc/adjtime: LOCAL). On UTC-RTC hosts it is 0 for every zone, so 0 is
+ * passed through unchanged; a non-zero value is replaced with the spoofed
+ * zone's current offset (minutes west of UTC, as the kernel reports it).
+ */
+struct tzspoof_timezone {
+    int tz_minuteswest;
+    int tz_dsttime;
+};
+
+static int (*real_gettimeofday)(void *, void *) = NULL;
+
+int gettimeofday(void *restrict tv, void *restrict tzp) {
+    if (!real_gettimeofday) real_gettimeofday = (int (*)(void *, void *))dlsym(RTLD_NEXT, "gettimeofday");
+    if (!real_gettimeofday) return -1;
+    int res = real_gettimeofday(tv, tzp);
+    struct tzspoof_timezone *tz = tzp;
+    if (res == 0 && tz && tz->tz_minuteswest != 0 && getenv("TZSPOOF_TARGET_PATH")) {
+        time_t now = time(NULL);
+        struct tm tm;
+        if (localtime_r(&now, &tm)) {
+            tz->tz_minuteswest = (int)(-tm.tm_gmtoff / 60);
+            tz->tz_dsttime = 0;
+        }
+    }
     return res;
 }
 

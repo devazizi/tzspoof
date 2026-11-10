@@ -22,6 +22,9 @@
 #define HOSTNAME_FILE   "/etc/hostname"
 #define HOSTS_FILE      "/etc/hosts"
 #define NSSWITCH_FILE   "/etc/nsswitch.conf"
+/* Distribution clock settings naming the zone (RHEL/SUSE, OpenRC). */
+#define SYSCONFIG_CLOCK "/etc/sysconfig/clock"
+#define CONFD_CLOCK     "/etc/conf.d/clock"
 #define TZS_HOST_NAME_MAX 64
 
 /* ANSI Colors */
@@ -48,6 +51,7 @@ typedef struct {
 typedef struct {
     char target_zone[128];
     char hostname[TZS_HOST_NAME_MAX + 1]; /* empty: keep the real hostname */
+    bool no_bus;                          /* do not fake org.freedesktop.timedate1 */
     bool interactive_shell;
     bool quiet;
     bool env_only;

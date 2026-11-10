@@ -3,6 +3,7 @@
 #endif
 #include "spoof.h"
 #include "tzutil.h"
+#include "busproxy.h"
 #include <sched.h>
 #include <sys/mount.h>
 #include <fcntl.h>
@@ -188,20 +189,58 @@ fail:
     return -1;
 }
 
-/* Replace target with scratch/name when both exist; warn (not fatal) on failure. */
-static void replace_optional(int scratch, const char *name, const char *target, bool quiet) {
+/* Replace target with scratch/name when both exist; warn (not fatal) on failure.
+ * Returns true only if the replacement is in place. */
+static bool replace_optional(int scratch, const char *name, const char *target, bool quiet) {
     if (faccessat(scratch, name, F_OK, AT_SYMLINK_NOFOLLOW) != 0 ||
         faccessat(AT_FDCWD, target, F_OK, AT_SYMLINK_NOFOLLOW) != 0) {
-        return;
+        return false;
     }
-    if (!mount_over(scratch, name, 0, target) && !quiet) {
-        fprintf(stderr, "%s[!] Warning: could not replace %s (%s); it still shows the outer value.%s\n",
-                CLR_YELLOW, target, strerror(errno), CLR_RESET);
+    if (!mount_over(scratch, name, 0, target)) {
+        if (!quiet) {
+            fprintf(stderr, "%s[!] Warning: could not replace %s (%s); it still shows the outer value.%s\n",
+                    CLR_YELLOW, target, strerror(errno), CLR_RESET);
+        }
+        return false;
     }
+    return true;
+}
+
+/*
+ * Rewrite ZONE=/TIMEZONE= lines of a distribution clock config file
+ * (/etc/sysconfig/clock, /etc/conf.d/clock) into scratch/name.
+ * Returns false when the source does not exist or names no zone.
+ */
+static bool write_clock_config(int dir, const char *name, const char *src, const char *zone) {
+    char *orig = read_small_file(src);
+    if (!orig) return false;
+    size_t cap = strlen(orig) + 64 + 2 * strlen(zone);
+    char *out = calloc(1, cap);
+    bool found = false;
+    if (out) {
+        char *save = NULL;
+        for (char *line = strtok_r(orig, "\n", &save); line; line = strtok_r(NULL, "\n", &save)) {
+            const char *p = line + strspn(line, " \t");
+            const char *keys[] = {"ZONE=", "TIMEZONE=", NULL};
+            bool replaced = false;
+            for (int k = 0; keys[k]; k++) {
+                if (strncmp(p, keys[k], strlen(keys[k])) == 0) {
+                    snprintf(out + strlen(out), cap - strlen(out), "%s\"%s\"\n", keys[k], zone);
+                    replaced = found = true;
+                    break;
+                }
+            }
+            if (!replaced) snprintf(out + strlen(out), cap - strlen(out), "%s\n", line);
+        }
+    }
+    bool ok = out && found && write_scratch(dir, name, out);
+    free(out);
+    free(orig);
+    return ok;
 }
 
 bool spoof_setup_namespaces(const char *tz_canonical, const char *tz_path, const char *hostname,
-                            bool quiet) {
+                            bool fake_bus, bool quiet) {
     uid_t uid = getuid();
     gid_t gid = getgid();
 
@@ -268,6 +307,17 @@ bool spoof_setup_namespaces(const char *tz_canonical, const char *tz_path, const
 
     /* Optional files; /etc/timezone exists mainly on Debian-family hosts. */
     replace_optional(scratch, "timezone", TIMEZONE_FILE, quiet);
+    if (write_clock_config(scratch, "sysconfig-clock", SYSCONFIG_CLOCK, tz_canonical)) {
+        replace_optional(scratch, "sysconfig-clock", SYSCONFIG_CLOCK, quiet);
+    }
+    if (write_clock_config(scratch, "confd-clock", CONFD_CLOCK, tz_canonical)) {
+        replace_optional(scratch, "confd-clock", CONFD_CLOCK, quiet);
+    }
+    /* timedatectl & co. ask systemd-timedated over the system bus. */
+    if (fake_bus && busproxy_prepare(scratch) &&
+        !replace_optional(scratch, BUSPROXY_SOCKET_NAME, SYSTEM_BUS_SOCKET, quiet)) {
+        busproxy_cancel();
+    }
     if (hostname) {
         replace_optional(scratch, "hostname", HOSTNAME_FILE, quiet);
         replace_optional(scratch, "hosts", HOSTS_FILE, quiet);
@@ -360,6 +410,7 @@ int spoof_execute(const tz_config_t *config, const tz_info_t *info, bool userns_
         }
 
         char *shell_args[] = { (char *)shell, NULL };
+        busproxy_start(info->canonical);
         execvp(shell, shell_args);
 
         perror("execvp (subshell)");
@@ -367,6 +418,7 @@ int spoof_execute(const tz_config_t *config, const tz_info_t *info, bool userns_
     }
 
     /* Execute custom command */
+    busproxy_start(info->canonical);
     execvp(config->cmd_argv[0], config->cmd_argv);
 
     perror("execvp (command)");
